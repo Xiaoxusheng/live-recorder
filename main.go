@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,30 @@ import (
 	"sync"
 	"time"
 )
+
+// ==========================================
+// 核心升级：打包静态资源
+// ==========================================
+
+//go:embed index.html
+var indexHtml []byte // ✨ 魔法发生在这里：编译时会将 index.html 的内容自动塞入这个变量
+
+// 全局 ffmpeg 路径变量
+var ffmpegPath string = "ffmpeg"
+
+// ==========================================
+// 核心优化 1：全局 HTTP 连接池复用
+// 避免每次请求都新建 http.Client 导致大量 TCP 挥手和内存暴增
+// ==========================================
+var globalHTTPClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false, // 允许连接复用
+	},
+}
 
 // ==========================================
 // 全局状态与结构定义
@@ -451,11 +476,22 @@ func generateABogus(params, userAgent string) string {
 // 辅助工具函数
 // ==========================================
 
+// 智能检测当前目录的 FFmpeg
 func checkFFmpeg() {
-	_, err := exec.LookPath("ffmpeg")
-	if err != nil {
-		log.Println("【严重警告】系统中未找到 ffmpeg 工具！程序无法录制。请安装 ffmpeg。")
+	localPath := filepath.Join(".", "ffmpeg.exe")
+	if _, err := os.Stat(localPath); err == nil {
+		absPath, _ := filepath.Abs(localPath)
+		ffmpegPath = absPath
+		log.Println("✅ 成功加载本地 ffmpeg:", ffmpegPath)
+		return
 	}
+	path, err := exec.LookPath("ffmpeg")
+	if err == nil {
+		ffmpegPath = path
+		log.Println("✅ 成功加载系统 ffmpeg:", ffmpegPath)
+		return
+	}
+	log.Println("❌ 【错误】未找到 ffmpeg！请将 ffmpeg.exe 放入程序同级目录！")
 }
 
 func extractRoomID(input string) string {
@@ -537,7 +573,7 @@ func formatQualityName(quality string) string {
 }
 
 // ==========================================
-// 抖音平台实现部分 (集成 a_bogus 签名)
+// 抖音平台实现部分
 // ==========================================
 
 type DouyinPlatform struct{}
@@ -563,7 +599,7 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 	aBogus := generateABogus(query, ua)
 	apiURL := fmt.Sprintf("https://live.douyin.com/webcast/room/web/enter/?%s&a_bogus=%s", query, aBogus)
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	// 使用全局连接池，代替原来的 new Client
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return "", "", err
@@ -582,7 +618,7 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 		req.Header.Set("Cookie", "ttwid=1%7C2iDIYVmjzMcpZ20fcaFde0VghXAA3NaNXE_SLR68IyE%7C1761045455%7Cab35197d5cfb21df6cbb2fa7ef1c9262206b062c315b9d04da746d0b37dfbc7d")
 	}
 
-	resp, err := client.Do(req)
+	resp, err := globalHTTPClient.Do(req)
 	if err != nil {
 		return "", "", err
 	}
@@ -649,7 +685,6 @@ type KuaishouPlatform struct{}
 func (k *KuaishouPlatform) GetPlatformName() string { return "Kuaishou" }
 func (k *KuaishouPlatform) GetStreamURL(roomID string, quality string) (string, string, error) {
 	reqURL := fmt.Sprintf("https://live.kuaishou.com/u/%s", roomID)
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return "", "", err
@@ -665,7 +700,7 @@ func (k *KuaishouPlatform) GetStreamURL(roomID string, quality string) (string, 
 		req.Header.Set("Cookie", "did=web_12345678901234567890123456789012")
 	}
 
-	resp, err := client.Do(req)
+	resp, err := globalHTTPClient.Do(req)
 	if err != nil {
 		return "", "", err
 	}
@@ -718,7 +753,6 @@ func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, stri
 	formData.Set("type", "live")
 	formData.Set("player_type", "html5")
 
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("POST", apiURL, strings.NewReader(formData.Encode()))
 	if err != nil {
 		return "", "", err
@@ -732,7 +766,7 @@ func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, stri
 	}
 	cookieMutex.RUnlock()
 
-	resp, err := client.Do(req)
+	resp, err := globalHTTPClient.Do(req)
 	if err != nil {
 		return "", "", err
 	}
@@ -784,18 +818,20 @@ func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorNa
 	var args []string
 	var outPath string
 
+	// 增加 -analyzeduration 和 -probesize 限制 ffmpeg 缓冲大小，节省多开内存
 	if segmentTime > 0 {
 		outPath = filepath.Join(outDir, fmt.Sprintf("%s_%s_%%03d.mp4", safeName, timestamp))
-		args = []string{"-y", "-i", streamURL, "-c", "copy", "-f", "segment", "-segment_time", fmt.Sprintf("%d", segmentTime*60), "-reset_timestamps", "1", outPath}
+		args = []string{"-y", "-analyzeduration", "2000000", "-probesize", "2000000", "-i", streamURL, "-c", "copy", "-f", "segment", "-segment_time", fmt.Sprintf("%d", segmentTime*60), "-reset_timestamps", "1", outPath}
 	} else {
 		outPath = filepath.Join(outDir, fmt.Sprintf("%s_%s.mp4", safeName, timestamp))
-		args = []string{"-y", "-i", streamURL, "-c", "copy", "-f", "mp4", outPath}
+		args = []string{"-y", "-analyzeduration", "2000000", "-probesize", "2000000", "-i", streamURL, "-c", "copy", "-f", "mp4", outPath}
 	}
 
 	log.Printf("\n🟢 [开始录制] 平台: %s | 主播: %s | 画质: %s\n   📂 路径: %s", platformName, anchorName, formatQualityName(quality), outPath)
 
 	startTime := time.Now()
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	// 使用智能检测到的全局 ffmpegPath
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	err := cmd.Run()
@@ -852,9 +888,13 @@ func MonitorLive(p Platform, roomID string) {
 			if state != "deleted" && state != "paused" {
 				log.Printf("⏳ [断流等待] %s %s 进入15秒冷却...", platformName, name)
 				updateStatus(platformName, roomID, name, q, "断流缓冲中")
+
+				// 替换为严谨的 NewTimer 以回收内存，防止内存泄漏
+				t := time.NewTimer(15 * time.Second)
 				select {
 				case <-ctx.Done():
-				case <-time.After(15 * time.Second):
+					t.Stop()
+				case <-t.C:
 				}
 			}
 		} else {
@@ -870,9 +910,12 @@ func MonitorLive(p Platform, roomID string) {
 
 			updateStatus(platformName, roomID, name, q, "未开播等待中")
 
+			// 替换为严谨的 NewTimer 以回收内存，防止内存泄漏
+			t := time.NewTimer(time.Duration(sleepDur+jitter) * time.Second)
 			select {
 			case <-ctx.Done():
-			case <-time.After(time.Duration(sleepDur+jitter) * time.Second):
+				t.Stop()
+			case <-t.C:
 			}
 		}
 
@@ -919,11 +962,9 @@ func removeFromConfig(platform, roomID string) {
 // ==========================================
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	if _, err := os.Stat("index.html"); os.IsNotExist(err) {
-		w.Write([]byte("Missing index.html"))
-		return
-	}
-	http.ServeFile(w, r, "index.html")
+	// 改动：不再读取硬盘文件，直接返回内存中打包的 HTML
+	w.Header().Set("Content-Type", "text/html")
+	w.Write(indexHtml)
 }
 
 func apiConfig(w http.ResponseWriter, r *http.Request) {
@@ -1092,7 +1133,7 @@ func main() {
 	}
 
 	log.Println("🚀 服务已启动，监听端口 9091")
-	log.Println("👉 内网访问地址: http://192.168.5.10:9091")
+	log.Println("👉 请自行查看本机 IP 访问，或尝试: http://localhost:9091")
 
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/api/config", apiConfig)
@@ -1101,7 +1142,8 @@ func main() {
 	http.HandleFunc("/api/add", apiAdd)
 	http.HandleFunc("/api/control", apiControl)
 
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	// 修改点：修复了你上次代码里最后的 :8080，统一使用 :9091 允许所有网卡访问
+	if err := http.ListenAndServe(":9091", nil); err != nil {
 		log.Fatalf("Web服务启动失败: %v", err)
 	}
 }
