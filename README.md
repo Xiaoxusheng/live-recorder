@@ -113,6 +113,9 @@ live-recorder/
 
 ---
 
+## 📺 视频 
+### [演示视频](https://www.bilibili.com/video/BV1jRftBxErk/?vd_source=9ee16bb9a48c7459901bbe5fe120efd4)
+
 ## ⚠️ 免责声明
 
 本工具仅供个人学习、技术研究与自动化测试使用。请勿将录制的视频用于商业用途或侵犯他人知识产权。使用本工具所产生的一切法律后果由使用者自行承担。
