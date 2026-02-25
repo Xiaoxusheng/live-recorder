@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>直播录制控制台</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/@arco-design/web-vue@2.43.0/dist/arco.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/@arco-design/web-vue@2.43.0/dist/arco-vue.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@arco-design/web-vue@2.43.0/dist/arco-vue-icon.min.js"></script>
+
+  <style>
+    body {
+      background-color: #f2f3f5;
+      margin: 0;
+      padding: 15px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .header {
+      margin-bottom: 24px;
+      text-align: center;
+      color: #1d2129;
+      font-size: 1.5rem;
+    }
+    .custom-card {
+      margin-bottom: 20px;
+      border-radius: 8px;
+      /* 去掉卡片阴影，改用极细边框 */
+      box-shadow: none;
+      border: 1px solid #e5e6eb;
+    }
+    .responsive-form {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 15px;
+      align-items: flex-end;
+    }
+    .responsive-form .arco-form-item {
+      margin-bottom: 0;
+    }
+    .full-width {
+      flex: 1 1 200px;
+    }
+    .btn-wrap {
+      flex: 0 0 auto;
+    }
+
+    /* 彻底去除表格 fixed 固定列产生的边缘阴影 */
+    .arco-table .arco-table-col-fixed-left-last::after,
+    .arco-table .arco-table-col-fixed-right-first::after,
+    .arco-table-th-fixed-left::after,
+    .arco-table-td-fixed-left::after,
+    .arco-table-th-fixed-right::after,
+    .arco-table-td-fixed-right::after {
+      box-shadow: none !important;
+      display: none !important;
+    }
+
+    @media (max-width: 768px) {
+      body { padding: 10px; }
+      .header { font-size: 1.25rem; }
+      .responsive-form { flex-direction: column; align-items: stretch; }
+      .btn-wrap { display: flex; flex-direction: column; }
+      .btn-wrap .arco-btn { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+<div id="app" class="container">
+  <h2 class="header">📺 跨平台直播自动录制控制台</h2>
+
+  <a-card title="⚙️ 全局设置与 Cookie 管理" class="custom-card">
+    <a-tabs default-active-key="1">
+      <a-tab-pane key="1" title="基础设置">
+        <div class="responsive-form" style="margin-top: 10px;">
+          <a-form-item label="录制保存路径" tooltip="可以填写绝对路径(如 D:\video) 或相对路径，默认 ./downloads" class="full-width" style="flex-basis: 100%;">
+            <a-input v-model="settings.save_path" placeholder="例如: ./downloads"></a-input>
+          </a-form-item>
+
+          <a-form-item label="默认录制画质" class="full-width">
+            <a-select v-model="settings.quality" placeholder="选择画质">
+              <a-option value="uhd">蓝光 / 超清 (最高画质)</a-option>
+              <a-option value="hd">高清</a-option>
+              <a-option value="sd">标清</a-option>
+            </a-select>
+          </a-form-item>
+
+          <a-form-item label="自动分片时长 (分钟)" tooltip="达到此时间后自动分割视频文件，0表示不分割" class="full-width">
+            <a-input-number v-model="settings.segment_time" :min="0" :max="1440" placeholder="填写分钟数, 0为不限制"></a-input-number>
+          </a-form-item>
+
+          <div class="btn-wrap">
+            <a-button type="primary" status="success" @click="saveSettings" :loading="saving">
+              <template #icon><icon-save /></template> 保存基础设置
+            </a-button>
+          </div>
+        </div>
+      </a-tab-pane>
+
+      <a-tab-pane key="2" title="身份验证 (Cookie)">
+        <div style="margin-top: 10px; color: #86909c; font-size: 13px; margin-bottom: 15px;">
+          如果发现程序一直在监控但始终无法开始录制，可能是由于平台风控，请在此更新对应平台的浏览器 Cookie。
+        </div>
+        <a-form layout="vertical" :model="cookies">
+          <a-form-item label="抖音 (Douyin) Cookie">
+            <a-textarea v-model="cookies.douyin" placeholder="填入从浏览器抓取的抖音 Cookie，可解决验证码风控问题" allow-clear auto-size></a-textarea>
+          </a-form-item>
+          <a-form-item label="快手 (Kuaishou) Cookie">
+            <a-textarea v-model="cookies.kuaishou" placeholder="填入快手 Cookie (选填)" allow-clear auto-size></a-textarea>
+          </a-form-item>
+          <a-form-item label="Soop Cookie">
+            <a-textarea v-model="cookies.soop" placeholder="填入 Soop Cookie (用于需要登录的特定房间)" allow-clear auto-size></a-textarea>
+          </a-form-item>
+          <a-button type="primary" status="warning" @click="saveCookies" :loading="savingCookies">
+            <template #icon><icon-safe /></template> 热更新 Cookie (立即生效)
+          </a-button>
+        </a-form>
+      </a-tab-pane>
+    </a-tabs>
+  </a-card>
+
+  <a-card title="➕ 添加新监控任务" class="custom-card">
+    <div class="responsive-form">
+      <a-form-item label="直播平台">
+        <a-select v-model="form.platform" placeholder="请选择平台">
+          <a-option value="Douyin">抖音 (Douyin)</a-option>
+          <a-option value="Kuaishou">快手 (Kuaishou)</a-option>
+          <a-option value="Soop">Soop (AfreecaTV)</a-option>
+        </a-select>
+      </a-form-item>
+
+      <a-form-item label="直播间地址 / 主播ID" class="full-width">
+        <a-input
+                v-model="form.url"
+                placeholder="支持粘贴完整的网页长链接或纯数字ID"
+                allow-clear>
+        </a-input>
+      </a-form-item>
+
+      <div class="btn-wrap">
+        <a-button type="primary" @click="handleAdd" :loading="adding">
+          <template #icon><icon-plus /></template> 立即添加
+        </a-button>
+      </div>
+    </div>
+  </a-card>
+
+  <a-card title="📡 实时运行状态" class="custom-card">
+    <template #extra>
+      <a-button type="outline" @click="fetchStatus" size="small" shape="round">
+        <template #icon><icon-refresh /></template> 手动刷新
+      </a-button>
+    </template>
+
+    <a-table :data="tasks" :pagination="false" :bordered="false" stripe :scroll="{ x: 1200 }">
+      <template #empty>
+        <a-empty description="暂无监控任务，请在上方添加"></a-empty>
+      </template>
+
+      <template #columns>
+        <a-table-column title="当前状态" data-index="status" :width="110" fixed="left">
+          <template #cell="{ record }">
+            <a-badge v-if="record.is_paused" status="normal" color="gray" text="已暂停"></a-badge>
+            <a-badge v-else-if="record.status === '录制中'" status="success" :text="record.status"></a-badge>
+            <a-badge v-else-if="record.status === '监控中'" status="processing" :text="record.status"></a-badge>
+            <a-badge v-else-if="record.status === '初始化中'" status="warning" :text="record.status"></a-badge>
+            <a-badge v-else status="normal" :text="record.status"></a-badge>
+          </template>
+        </a-table-column>
+
+        <a-table-column title="主播名称" data-index="anchor_name" :width="160">
+          <template #cell="{ record }">
+            <span style="font-weight: 600; color: #1d2129; font-size: 1.1em;">{{ record.anchor_name }}</span>
+          </template>
+        </a-table-column>
+
+        <a-table-column title="平台" data-index="platform" :width="90">
+          <template #cell="{ record }">
+            <a-tag v-if="record.platform === 'Douyin'" color="black" size="small">抖音</a-tag>
+            <a-tag v-else-if="record.platform === 'Kuaishou'" color="orange" size="small">快手</a-tag>
+            <a-tag v-else-if="record.platform === 'Soop'" color="blue" size="small">Soop</a-tag>
+            <a-tag v-else color="gray" size="small">{{ record.platform }}</a-tag>
+          </template>
+        </a-table-column>
+
+        <a-table-column title="当前画质" data-index="quality" :width="100">
+          <template #cell="{ record }">
+            <a-tag v-if="record.quality === 'uhd'" color="purple" size="small" bordered>蓝光超清</a-tag>
+            <a-tag v-else-if="record.quality === 'hd'" color="arcoblue" size="small" bordered>高清</a-tag>
+            <a-tag v-else-if="record.quality === 'sd'" color="gray" size="small" bordered>标清</a-tag>
+            <span v-else>-</span>
+          </template>
+        </a-table-column>
+
+        <a-table-column title="本次录制时长" data-index="duration" :width="130">
+          <template #cell="{ record }">
+            <span v-if="record.duration && record.duration !== '-'" style="color: #165dff; font-family: monospace; font-weight: bold;">
+              <icon-clock-circle /> {{ record.duration }}
+            </span>
+            <span v-else style="color: #86909c;">-</span>
+          </template>
+        </a-table-column>
+
+        <a-table-column title="本地占用大小" data-index="file_size" :width="120">
+          <template #cell="{ record }">
+            <span v-if="record.file_size" style="font-weight: bold; color: #ff7d00;">
+              <icon-storage /> {{ record.file_size }}
+            </span>
+            <span v-else style="color: #86909c;">-</span>
+          </template>
+        </a-table-column>
+
+        <a-table-column title="最后动态时间" data-index="update_time" :width="180"></a-table-column>
+
+        <a-table-column title="操作" align="center" :width="140" fixed="right">
+          <template #cell="{ record }">
+            <a-space>
+              <a-button v-if="record.is_paused" type="primary" size="small" status="success" @click="handleControl('resume', record)">
+                恢复
+              </a-button>
+              <a-button v-else type="primary" size="small" status="warning" @click="handleControl('pause', record)">
+                暂停
+              </a-button>
+
+              <a-popconfirm content="确定要永久删除这个监控任务吗？(已录制文件不会被删除)" type="error" @ok="handleControl('delete', record)">
+                <a-button type="primary" size="small" status="danger">
+                  删除
+                </a-button>
+              </a-popconfirm>
+            </a-space>
+          </template>
+        </a-table-column>
+      </template>
+    </a-table>
+  </a-card>
+</div>
+
+<script>
+  const { createApp, ref, onMounted, onUnmounted } = Vue;
+
+  const App = {
+    setup() {
+      const form = ref({ platform: 'Douyin', url: '' });
+      // 保存路径默认 ./downloads
+      const settings = ref({ quality: 'uhd', segment_time: 0, save_path: './downloads' });
+      const cookies = ref({ douyin: '', kuaishou: '', soop: '' });
+      const tasks = ref([]);
+
+      const adding = ref(false);
+      const saving = ref(false);
+      const savingCookies = ref(false);
+      let timer = null;
+
+      // 获取全局设置与 Cookie
+      const fetchConfigAndCookies = async () => {
+        try {
+          const res1 = await fetch('/api/config');
+          const data1 = await res1.json();
+          if (data1) {
+            settings.value.quality = data1.quality || 'uhd';
+            settings.value.segment_time = data1.segment_time || 0;
+            // 回显保存路径
+            settings.value.save_path = data1.save_path || './downloads';
+          }
+          const res2 = await fetch('/api/cookies');
+          const data2 = await res2.json();
+          if (data2) {
+            cookies.value = data2;
+          }
+        } catch (e) { console.error("获取设置失败", e); }
+      };
+
+      // 保存全局设置
+      const saveSettings = async () => {
+        saving.value = true;
+        try {
+          const res = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(settings.value)
+          });
+          const data = await res.json();
+          if (data.code === 0) ArcoVue.Message.success("基础设置已保存，将在下次重新拉流时生效");
+        } catch (e) {
+          ArcoVue.Message.error("保存失败，请检查后端网络");
+        } finally { saving.value = false; }
+      };
+
+      // 保存更新 Cookie
+      const saveCookies = async () => {
+        savingCookies.value = true;
+        try {
+          const res = await fetch('/api/cookies', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(cookies.value)
+          });
+          const data = await res.json();
+          if (data.code === 0) ArcoVue.Message.success("Cookie 更新成功，后台任务将立即采用新身份抓取");
+        } catch (e) {
+          ArcoVue.Message.error("Cookie 更新失败");
+        } finally { savingCookies.value = false; }
+      };
+
+      // 获取后台实时状态列表
+      const fetchStatus = async () => {
+        try {
+          const res = await fetch('/api/status');
+          const data = await res.json();
+          tasks.value = data || [];
+        } catch (e) { console.error("获取状态失败", e); }
+      };
+
+      // 提交添加新主播任务
+      const handleAdd = async () => {
+        if (!form.value.url.trim()) return ArcoVue.Message.warning("请填写直播间地址或ID");
+        adding.value = true;
+        try {
+          const res = await fetch('/api/add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(form.value)
+          });
+          const data = await res.json();
+          if (data.code === 0) {
+            ArcoVue.Message.success("成功添加监控任务！");
+            form.value.url = '';
+            await fetchStatus();
+          } else {
+            ArcoVue.Message.error(data.msg || "添加失败");
+          }
+        } catch (e) {
+          ArcoVue.Message.error("添加失败，后端服务可能未响应");
+        } finally { adding.value = false; }
+      };
+
+      // 处理暂停、恢复、删除任务操作
+      const handleControl = async (action, record) => {
+        try {
+          const res = await fetch('/api/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: action,
+              platform: record.platform,
+              room_id: record.room_id
+            })
+          });
+          const data = await res.json();
+          if (data.code === 0) {
+            if (action === 'delete') ArcoVue.Message.success("任务已删除");
+            else if (action === 'pause') ArcoVue.Message.success("任务已暂停");
+            else ArcoVue.Message.success("任务已恢复");
+            // 操作成功后立即刷新状态列表
+            await fetchStatus();
+          }
+        } catch (e) {
+          ArcoVue.Message.error("操作请求失败");
+        }
+      };
+
+      onMounted(() => {
+        fetchConfigAndCookies();
+        fetchStatus();
+        timer = setInterval(fetchStatus, 3000);
+      });
+
+      onUnmounted(() => { if (timer) clearInterval(timer); });
+
+      return {
+        form, settings, cookies, tasks, adding, saving, savingCookies,
+        fetchStatus, handleAdd, saveSettings, saveCookies, handleControl
+      };
+    }
+  };
+
+  const app = createApp(App);
+  app.use(ArcoVue);
+  app.use(ArcoVueIcon);
+  app.mount('#app');
+</script>
+</body>
+</html>
