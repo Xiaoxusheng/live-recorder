@@ -43,7 +43,7 @@ jobs:
           # 确定文件名
           BIN_NAME="uploader"
           if [ "${{ matrix.os }}" = "windows" ]; then
-            BIN_NAME="uploader.exe"
+            BIN_NAME="live-recorder.exe"
           fi
           
           # 编译并注入版本号和时间
