@@ -41,7 +41,7 @@ jobs:
         shell: bash
         run: |
           # 确定文件名
-          BIN_NAME="uploader"
+          BIN_NAME="live-recorder"
           if [ "${{ matrix.os }}" = "windows" ]; then
             BIN_NAME="live-recorder.exe"
           fi
