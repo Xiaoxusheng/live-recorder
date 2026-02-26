@@ -14,10 +14,12 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -33,10 +35,9 @@ var ffmpegPath string = "ffmpeg"
 
 // ==========================================
 // 核心优化 1：全局 HTTP 连接池复用
-// 避免每次请求都新建 http.Client 导致大量 TCP 挥手和内存暴增
 // ==========================================
 var globalHTTPClient = &http.Client{
-	Timeout: 15 * time.Second,
+	Timeout: 30 * time.Second, // 应对某些节点响应慢的情况
 	Transport: &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
@@ -49,7 +50,6 @@ var globalHTTPClient = &http.Client{
 // 全局状态与结构定义
 // ==========================================
 
-// TaskStatus 包含了录制文件大小和此时长的字段
 type TaskStatus struct {
 	Platform   string `json:"platform"`
 	RoomID     string `json:"room_id"`
@@ -80,22 +80,19 @@ func updateStatus(platform, roomID, anchorName, quality, statusMsg string) {
 	now := time.Now()
 	var sTime time.Time
 
-	// 尝试继承并处理现有的名称和 startTime
 	if existing, ok := globalStatus.Load(key); ok {
 		oldTask := existing.(*TaskStatus)
 		if anchorName == "" {
 			anchorName = oldTask.AnchorName
 		}
-		// 管理录制开始时间
 		if statusMsg == "录制中" {
 			if oldTask.Status != "录制中" {
-				sTime = now // 刚刚由其他状态切入录制，记录此刻为起始时间
+				sTime = now
 			} else {
-				sTime = oldTask.startTime // 继续保持原有的起始时间
+				sTime = oldTask.startTime
 			}
 		}
 	} else {
-		// 第一次记录
 		if statusMsg == "录制中" {
 			sTime = now
 		}
@@ -119,7 +116,7 @@ func updateStatus(platform, roomID, anchorName, quality, statusMsg string) {
 		Status:     statusMsg,
 		UpdateTime: time.Now().Format("2006-01-02 15:04:05"),
 		IsPaused:   isPaused,
-		startTime:  sTime, // 将时间存于内存
+		startTime:  sTime,
 	})
 }
 
@@ -130,7 +127,8 @@ type Config struct {
 	Quality       string   `json:"quality"`
 	SegmentTime   int      `json:"segment_time"`
 	CheckInterval int      `json:"check_interval"`
-	SavePath      string   `json:"save_path"` // 新增：自定义录制文件保存路径
+	SavePath      string   `json:"save_path"`
+	PausedTasks   []string `json:"paused_tasks"` // 持久化保存被暂停任务的 Key 列表
 }
 
 type CookieConfig struct {
@@ -142,6 +140,36 @@ type CookieConfig struct {
 type Platform interface {
 	GetPlatformName() string
 	GetStreamURL(roomID string, quality string) (streamURL string, anchorName string, err error)
+}
+
+// ==========================================
+// 统一的配置读写辅助函数
+// ==========================================
+
+func saveConfig() {
+	data, _ := json.MarshalIndent(globalConfig, "", "    ")
+	os.WriteFile("config.json", data, 0644)
+}
+
+func addPausedTask(key string) {
+	for _, k := range globalConfig.PausedTasks {
+		if k == key {
+			return
+		}
+	}
+	globalConfig.PausedTasks = append(globalConfig.PausedTasks, key)
+	saveConfig()
+}
+
+func removePausedTask(key string) {
+	var res []string
+	for _, k := range globalConfig.PausedTasks {
+		if k != key {
+			res = append(res, k)
+		}
+	}
+	globalConfig.PausedTasks = res
+	saveConfig()
 }
 
 // ==========================================
@@ -476,7 +504,6 @@ func generateABogus(params, userAgent string) string {
 // 辅助工具函数
 // ==========================================
 
-// 智能检测当前目录的 FFmpeg
 func checkFFmpeg() {
 	localPath := filepath.Join(".", "ffmpeg.exe")
 	if _, err := os.Stat(localPath); err == nil {
@@ -501,6 +528,13 @@ func extractRoomID(input string) string {
 		if err == nil {
 			path := strings.Trim(u.Path, "/")
 			segments := strings.Split(path, "/")
+
+			if strings.Contains(u.Host, "sooplive.co.kr") || strings.Contains(u.Host, "afreecatv.com") {
+				if len(segments) > 0 {
+					return segments[0]
+				}
+			}
+
 			if len(segments) > 0 {
 				return segments[len(segments)-1]
 			}
@@ -527,7 +561,6 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%02d分%02d秒", m, s)
 }
 
-// 计算指定文件夹大小
 func getDirSizeStr(path string) string {
 	var size int64
 	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
@@ -545,7 +578,6 @@ func getDirSizeStr(path string) string {
 	return formatBytes(size)
 }
 
-// 格式化字节大小输出 MB/GB
 func formatBytes(b int64) string {
 	const unit = 1024
 	if b < unit {
@@ -599,7 +631,6 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 	aBogus := generateABogus(query, ua)
 	apiURL := fmt.Sprintf("https://live.douyin.com/webcast/room/web/enter/?%s&a_bogus=%s", query, aBogus)
 
-	// 使用全局连接池，代替原来的 new Client
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return "", "", err
@@ -746,19 +777,27 @@ func (k *KuaishouPlatform) GetStreamURL(roomID string, quality string) (string, 
 type SoopPlatform struct{}
 
 func (s *SoopPlatform) GetPlatformName() string { return "Soop" }
+
 func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, string, error) {
-	apiURL := "https://live.afreecatv.com/afreeca/player_live_api.php"
+	apiURL := "http://api.m.sooplive.co.kr/broad/a/watch"
 	formData := url.Values{}
-	formData.Set("bid", roomID)
-	formData.Set("type", "live")
-	formData.Set("player_type", "html5")
+	formData.Set("bj_id", roomID)
+	formData.Set("broad_no", "")
+	formData.Set("agent", "web")
+	formData.Set("confirm_adult", "true")
+	formData.Set("player_type", "webm")
+	formData.Set("mode", "live")
 
 	req, err := http.NewRequest("POST", apiURL, strings.NewReader(formData.Encode()))
 	if err != nil {
-		return "", "", err
+		return "", roomID, err
 	}
+
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0")
+	req.Header.Set("Origin", "https://m.sooplive.co.kr")
+	req.Header.Set("Referer", "https://m.sooplive.co.kr/")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2")
 
 	cookieMutex.RLock()
 	if globalCookies.Soop != "" {
@@ -768,34 +807,106 @@ func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, stri
 
 	resp, err := globalHTTPClient.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", roomID, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
-	var result map[string]interface{}
-	json.Unmarshal(body, &result)
-
-	channelInfo, ok := result["CHANNEL"].(map[string]interface{})
-	if !ok {
-		return "", roomID, nil
+	if err != nil {
+		return "", roomID, err
 	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", roomID, fmt.Errorf("JSON 解析失败: %v", err)
+	}
+
+	dataMap, _ := result["data"].(map[string]interface{})
 
 	anchorName := roomID
-	if n, ok := channelInfo["BJNICK"].(string); ok {
-		anchorName = n
-	}
-
-	if res, ok := channelInfo["RESULT"].(float64); ok && res == 1 {
-		if url, ok := channelInfo["CHDOMAIN"].(string); ok {
-			return url, anchorName, nil
+	if dataMap != nil {
+		if nick, ok := dataMap["user_nick"].(string); ok && nick != "" {
+			if bjID, ok := dataMap["bj_id"].(string); ok && bjID != "" {
+				anchorName = fmt.Sprintf("%s-%s", nick, bjID)
+			} else {
+				anchorName = nick
+			}
 		}
 	}
-	return "", anchorName, nil
+
+	resCode, ok := result["result"].(float64)
+	if !ok || resCode != 1 {
+		if dataMap != nil {
+			if code, ok := dataMap["code"].(float64); ok {
+				if code == -6001 {
+					return "", anchorName, nil
+				} else if code == -3001 {
+					return "", anchorName, nil
+				} else if code == -3002 || code == -3004 {
+					return "", anchorName, fmt.Errorf("该直播需要19+登录或验证，请在配置中提供对应 Cookie (code: %v)", code)
+				}
+			}
+		}
+		return "", anchorName, fmt.Errorf("未知异常或开播请求失败。原始响应: %s", string(body))
+	}
+
+	broadNoStr := ""
+	if bn, ok := dataMap["broad_no"].(string); ok {
+		broadNoStr = bn
+	} else if bnFloat, ok := dataMap["broad_no"].(float64); ok {
+		broadNoStr = fmt.Sprintf("%.0f", bnFloat)
+	}
+
+	aid := ""
+	if a, ok := dataMap["hls_authentication_key"].(string); ok {
+		aid = a
+	}
+
+	if broadNoStr == "" || aid == "" {
+		return "", anchorName, fmt.Errorf("提取 broad_no 或 aid 失败")
+	}
+
+	cdnURL := fmt.Sprintf("http://livestream-manager.sooplive.co.kr/broad_stream_assign.html?return_type=gcp_cdn&use_cors=false&cors_origin_url=play.sooplive.co.kr&broad_key=%s-common-master-hls&time=8361.086329376785", broadNoStr)
+
+	reqCdn, err := http.NewRequest("GET", cdnURL, nil)
+	if err != nil {
+		return "", anchorName, err
+	}
+
+	reqCdn.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0")
+	reqCdn.Header.Set("Origin", "https://play.sooplive.co.kr")
+	reqCdn.Header.Set("Referer", "https://play.sooplive.co.kr/")
+	reqCdn.Header.Set("Accept-Language", "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2")
+	reqCdn.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	respCdn, err := globalHTTPClient.Do(reqCdn)
+	if err != nil {
+		return "", anchorName, err
+	}
+	defer respCdn.Body.Close()
+
+	bodyCdn, err := io.ReadAll(respCdn.Body)
+	if err != nil {
+		return "", anchorName, err
+	}
+
+	var cdnResult map[string]interface{}
+	if err := json.Unmarshal(bodyCdn, &cdnResult); err != nil {
+		return "", anchorName, fmt.Errorf("CDN响应 JSON 解析失败: %v, raw: %s", err, string(bodyCdn))
+	}
+
+	viewURL, ok := cdnResult["view_url"].(string)
+	if !ok || viewURL == "" {
+		return "", anchorName, fmt.Errorf("从 CDN 节点提取 view_url 失败")
+	}
+
+	finalStreamURL := fmt.Sprintf("%s?aid=%s", viewURL, aid)
+
+	return finalStreamURL, anchorName, nil
 }
 
 // ==========================================
-// 录制控制逻辑
+// 核心修复：防损坏的优雅录制逻辑
 // ==========================================
 
 func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorName, quality string, segmentTime int) {
@@ -805,7 +916,6 @@ func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorNa
 		safeName = roomID
 	}
 
-	// 动态获取全局配置中的保存路径，如果为空则默认使用 ./downloads
 	baseDir := globalConfig.SavePath
 	if baseDir == "" {
 		baseDir = "./downloads"
@@ -818,7 +928,6 @@ func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorNa
 	var args []string
 	var outPath string
 
-	// 增加 -analyzeduration 和 -probesize 限制 ffmpeg 缓冲大小，节省多开内存
 	if segmentTime > 0 {
 		outPath = filepath.Join(outDir, fmt.Sprintf("%s_%s_%%03d.mp4", safeName, timestamp))
 		args = []string{"-y", "-analyzeduration", "2000000", "-probesize", "2000000", "-i", streamURL, "-c", "copy", "-f", "segment", "-segment_time", fmt.Sprintf("%d", segmentTime*60), "-reset_timestamps", "1", outPath}
@@ -830,17 +939,57 @@ func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorNa
 	log.Printf("\n🟢 [开始录制] 平台: %s | 主播: %s | 画质: %s\n   📂 路径: %s", platformName, anchorName, formatQualityName(quality), outPath)
 
 	startTime := time.Now()
-	// 使用智能检测到的全局 ffmpegPath
-	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+
+	// 核心修复点 1：放弃使用 CommandContext 强制 Kill 进程
+	// 因为强制 Kill 会导致 MP4 无法写入末尾的 moov 元数据块，从而彻底损坏文件。
+	cmd := exec.Command(ffmpegPath, args...)
+
+	// 获取 ffmpeg 的标准输入通道 (stdin)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Printf("获取ffmpeg stdin失败: %v", err)
+		return
+	}
+
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	err := cmd.Run()
-	duration := time.Since(startTime)
 
-	if err != nil {
-		log.Printf("\n🔴 [录制结束] %s | %s | 时长: %s (异常/断流或已被手动暂停/删除)\n", platformName, anchorName, formatDuration(duration))
-	} else {
-		log.Printf("\n🔴 [录制结束] %s | %s | 时长: %s (完成)\n", platformName, anchorName, formatDuration(duration))
+	if err := cmd.Start(); err != nil {
+		log.Printf("\n🔴 [启动录制失败] %s | %s: %v\n", platformName, anchorName, err)
+		updateStatus(platformName, roomID, anchorName, quality, "未开播等待中")
+		return
+	}
+
+	// 监听进程自然结束
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case <-ctx.Done():
+		// 核心修复点 2：收到暂停、删除任务或服务退出的信号时，优雅通知 ffmpeg 停止
+		// 向其发送 'q' 指令，ffmpeg 会自动结束录制、补全文件头部信息，绝不损坏文件！
+		if stdin != nil {
+			io.WriteString(stdin, "q\n")
+			stdin.Close()
+		}
+
+		// 给予 ffmpeg 最多 10 秒钟时间安全保存视频
+		select {
+		case <-done:
+			log.Printf("\n🔴 [手动停止] %s | %s | 录像已安全保存完毕\n", platformName, anchorName)
+		case <-time.After(10 * time.Second):
+			cmd.Process.Kill() // 只有 ffmpeg 卡死时才进行强杀
+			log.Printf("\n🔴 [手动停止超时强杀] %s | %s\n", platformName, anchorName)
+		}
+	case err := <-done:
+		duration := time.Since(startTime)
+		if err != nil {
+			log.Printf("\n🔴 [录制异常/断流] %s | %s | 时长: %s\n", platformName, anchorName, formatDuration(duration))
+		} else {
+			log.Printf("\n🔴 [录制结束] %s | %s | 时长: %s (自然完成)\n", platformName, anchorName, formatDuration(duration))
+		}
 	}
 
 	updateStatus(platformName, roomID, anchorName, quality, "未开播等待中")
@@ -850,9 +999,24 @@ func MonitorLive(p Platform, roomID string) {
 	platformName := p.GetPlatformName()
 	key := platformName + "_" + roomID
 
-	taskStates.Store(key, "running")
-	log.Printf("👀 [启动监控] %s 房间: %s", platformName, roomID)
-	updateStatus(platformName, roomID, "", "-", "监控中")
+	isPaused := false
+	for _, pk := range globalConfig.PausedTasks {
+		if pk == key {
+			isPaused = true
+			break
+		}
+	}
+
+	if isPaused {
+		taskStates.Store(key, "paused")
+		log.Printf("👀 [启动监控] %s 房间: %s (初始状态: 已暂停)", platformName, roomID)
+		updateStatus(platformName, roomID, "", "-", "已暂停")
+	} else {
+		taskStates.Store(key, "running")
+		log.Printf("👀 [启动监控] %s 房间: %s", platformName, roomID)
+		updateStatus(platformName, roomID, "", "-", "监控中")
+	}
+
 	rand.Seed(time.Now().UnixNano())
 
 	for {
@@ -880,6 +1044,18 @@ func MonitorLive(p Platform, roomID string) {
 		url, name, err := p.GetStreamURL(roomID, q)
 		if err != nil {
 			log.Printf("⚠️ [检测出错] %s %s: %v", platformName, roomID, err)
+			updateStatus(platformName, roomID, name, q, "检测异常等待中")
+
+			sleepDur := globalConfig.CheckInterval
+			if sleepDur < 10 {
+				sleepDur = 10
+			}
+			t := time.NewTimer(time.Duration(sleepDur) * time.Second)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+			case <-t.C:
+			}
 		} else if url != "" {
 			updateStatus(platformName, roomID, name, q, "录制中")
 			RecordStream(ctx, url, platformName, roomID, name, q, st)
@@ -889,7 +1065,6 @@ func MonitorLive(p Platform, roomID string) {
 				log.Printf("⏳ [断流等待] %s %s 进入15秒冷却...", platformName, name)
 				updateStatus(platformName, roomID, name, q, "断流缓冲中")
 
-				// 替换为严谨的 NewTimer 以回收内存，防止内存泄漏
 				t := time.NewTimer(15 * time.Second)
 				select {
 				case <-ctx.Done():
@@ -910,7 +1085,6 @@ func MonitorLive(p Platform, roomID string) {
 
 			updateStatus(platformName, roomID, name, q, "未开播等待中")
 
-			// 替换为严谨的 NewTimer 以回收内存，防止内存泄漏
 			t := time.NewTimer(time.Duration(sleepDur+jitter) * time.Second)
 			select {
 			case <-ctx.Done():
@@ -953,8 +1127,7 @@ func removeFromConfig(platform, roomID string) {
 		globalConfig.Soop = remove(globalConfig.Soop, roomID)
 	}
 
-	data, _ := json.MarshalIndent(globalConfig, "", "    ")
-	os.WriteFile("config.json", data, 0644)
+	saveConfig()
 }
 
 // ==========================================
@@ -962,7 +1135,6 @@ func removeFromConfig(platform, roomID string) {
 // ==========================================
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	// 改动：不再读取硬盘文件，直接返回内存中打包的 HTML
 	w.Header().Set("Content-Type", "text/html")
 	w.Write(indexHtml)
 }
@@ -978,8 +1150,7 @@ func apiConfig(w http.ResponseWriter, r *http.Request) {
 		if c.SavePath != "" {
 			globalConfig.SavePath = c.SavePath
 		}
-		data, _ := json.MarshalIndent(globalConfig, "", "    ")
-		os.WriteFile("config.json", data, 0644)
+		saveConfig()
 	}
 	json.NewEncoder(w).Encode(globalConfig)
 }
@@ -1001,20 +1172,17 @@ func apiCookies(w http.ResponseWriter, r *http.Request) {
 	cookieMutex.RUnlock()
 }
 
-// 动态计算 "录制时长" 和 "本地文件夹占用大小"
 func apiStatus(w http.ResponseWriter, r *http.Request) {
 	var list []TaskStatus
 	globalStatus.Range(func(key, value interface{}) bool {
-		task := *value.(*TaskStatus) // 拷贝一份当前状态
+		task := *value.(*TaskStatus)
 
-		// 1. 动态计算本次录制时长
 		if task.Status == "录制中" && !task.startTime.IsZero() {
 			task.Duration = formatDuration(time.Since(task.startTime))
 		} else {
 			task.Duration = "-"
 		}
 
-		// 2. 动态计算本地主播文件夹总大小（根据自定义路径）
 		safeName := sanitizeFileName(task.AnchorName)
 		if safeName == "" {
 			safeName = task.RoomID
@@ -1051,8 +1219,7 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 		globalConfig.Soop = append(globalConfig.Soop, roomID)
 		p = &SoopPlatform{}
 	}
-	data, _ := json.MarshalIndent(globalConfig, "", "    ")
-	os.WriteFile("config.json", data, 0644)
+	saveConfig()
 	startMonitorIfNotRunning(p, roomID)
 	w.Write([]byte(`{"code":0}`))
 }
@@ -1076,14 +1243,17 @@ func apiControl(w http.ResponseWriter, r *http.Request) {
 		if cancel, ok := activeCancels.Load(key); ok {
 			cancel.(context.CancelFunc)()
 		}
+		addPausedTask(key)
 	case "resume":
 		taskStates.Store(key, "running")
+		removePausedTask(key)
 	case "delete":
 		taskStates.Store(key, "deleted")
 		if cancel, ok := activeCancels.Load(key); ok {
 			cancel.(context.CancelFunc)()
 		}
 		removeFromConfig(req.Platform, req.RoomID)
+		removePausedTask(key)
 	}
 
 	w.Write([]byte(`{"code":0}`))
@@ -1093,9 +1263,8 @@ func main() {
 	checkFFmpeg()
 
 	if _, err := os.Stat("config.json"); os.IsNotExist(err) {
-		globalConfig = &Config{Quality: "uhd", CheckInterval: 30, SavePath: "./downloads"}
-		d, _ := json.MarshalIndent(globalConfig, "", "    ")
-		os.WriteFile("config.json", d, 0644)
+		globalConfig = &Config{Quality: "uhd", CheckInterval: 30, SavePath: "./downloads", PausedTasks: []string{}}
+		saveConfig()
 	} else {
 		d, _ := os.ReadFile("config.json")
 		globalConfig = &Config{}
@@ -1106,6 +1275,9 @@ func main() {
 	}
 	if globalConfig.SavePath == "" {
 		globalConfig.SavePath = "./downloads"
+	}
+	if globalConfig.PausedTasks == nil {
+		globalConfig.PausedTasks = []string{}
 	}
 
 	if _, err := os.Stat("cookies.json"); os.IsNotExist(err) {
@@ -1132,6 +1304,25 @@ func main() {
 		startMonitorIfNotRunning(soop, extractRoomID(id))
 	}
 
+	// 核心修复点 3：全局防杀拦截，防止服务被重启、容器关闭时，直接强杀导致视频损坏
+	stopSignal := make(chan os.Signal, 1)
+	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stopSignal
+		log.Println("\n⚠️ 收到系统退出/重启信号！正在通知所有录像安全收尾并保存，请稍候...")
+		// 广播取消所有的录制上下文，触发优雅保存（发送 'q'）
+		activeCancels.Range(func(key, value interface{}) bool {
+			if cancel, ok := value.(context.CancelFunc); ok {
+				cancel()
+			}
+			return true
+		})
+		// 等待 3 秒钟给 ffmpeg 充足的时间写完文件尾部
+		time.Sleep(3 * time.Second)
+		log.Println("✅ 所有视频均已安全保存！服务正式退出。")
+		os.Exit(0)
+	}()
+
 	log.Println("🚀 服务已启动，监听端口 9091")
 	log.Println("👉 请自行查看本机 IP 访问，或尝试: http://localhost:9091")
 
@@ -1142,7 +1333,6 @@ func main() {
 	http.HandleFunc("/api/add", apiAdd)
 	http.HandleFunc("/api/control", apiControl)
 
-	// 修改点：修复了你上次代码里最后的 :8080，统一使用 :9091 允许所有网卡访问
 	if err := http.ListenAndServe(":9091", nil); err != nil {
 		log.Fatalf("Web服务启动失败: %v", err)
 	}
