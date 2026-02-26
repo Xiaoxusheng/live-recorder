@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2222%22 fill=%22%23165dff%22/><path d=%22M38 32 L72 50 L38 68 Z%22 fill=%22%23fff%22/></svg>">
   <title>直播录制控制台</title>
 
   <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
@@ -16,26 +17,31 @@
       margin: 0;
       padding: 20px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background-image: radial-gradient(#e5e6eb 1px, transparent 1px);
+      background-size: 20px 20px;
     }
+
     .main-container {
       max-width: 1400px;
       margin: 0 auto;
-      background: #ffffff;
-      border-radius: 8px;
-      box-shadow: 0 1px 10px rgba(0, 0, 0, 0.05);
-      padding: 24px;
+      background: rgba(255, 255, 255, 0.85);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.05);
+      padding: 16px 24px;
     }
 
-    /* 顶部工具栏 */
     .top-toolbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
       flex-wrap: wrap;
       gap: 16px;
-      margin-bottom: 24px;
+      margin-bottom: 16px;
       padding-bottom: 16px;
-      border-bottom: 1px solid #f2f3f5;
+      border-bottom: 1px solid rgba(229, 230, 235, 0.5);
     }
     .toolbar-left {
       display: flex;
@@ -47,16 +53,15 @@
       display: flex;
       align-items: center;
       gap: 16px;
-      font-size: 13px;
+      font-size: 12px;
       color: #4e5969;
     }
     .stat-item { display: flex; align-items: center; gap: 4px; }
     .stat-num { font-weight: bold; color: #1d2129; }
 
-    /* 状态指示圆点 */
     .status-dot {
-      width: 8px;
-      height: 8px;
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
       display: inline-block;
       margin-right: 6px;
@@ -67,11 +72,32 @@
       box-shadow: 0 0 6px rgba(0, 180, 42, 0.4);
     }
 
-    .live-link { color: #165dff; text-decoration: none; font-size: 13px; transition: color 0.2s; }
+    .live-link { color: #165dff; text-decoration: none; font-size: 12px; transition: color 0.2s; }
     .live-link:hover { color: #4080ff; text-decoration: underline; }
 
     .arco-table .arco-table-col-fixed-left-last::after,
     .arco-table .arco-table-col-fixed-right-first::after { box-shadow: none !important; display: none !important; }
+
+    /* 移动端样式适配 */
+    @media screen and (max-width: 768px) {
+      body { padding: 8px; }
+      .main-container { padding: 12px; }
+      .top-toolbar { flex-direction: column; align-items: stretch; }
+      .toolbar-left { flex-wrap: wrap; gap: 8px; }
+      /* 输入框等宽度在移动端铺满 */
+      .toolbar-left .arco-input-wrapper,
+      .toolbar-left .arco-input-group { width: 100% !important; }
+      .toolbar-left .arco-input-group .arco-select { width: 35% !important; }
+      .toolbar-left .arco-input-group .arco-input-wrapper { width: 65% !important; }
+      .toolbar-left > button { flex: 1; }
+      .toolbar-right { justify-content: space-between; margin-top: 8px; width: 100%; }
+
+      /* 弹窗在移动端宽度适配 */
+      .arco-modal {
+        width: 95vw !important;
+        max-width: 95vw !important;
+      }
+    }
   </style>
 </head>
 <body>
@@ -80,19 +106,21 @@
 
     <div class="top-toolbar">
       <div class="toolbar-left">
-        <a-input-search
+        <a-input
                 v-model="searchQuery"
-                placeholder="搜索主播或链接 (Ctrl+F)"
-                style="width: 240px; background-color: #f2f3f5; border: none;">
-        </a-input-search>
+                placeholder="搜索主播或链接"
+                allow-clear
+                style="width: 240px; background-color: rgba(242, 243, 245, 0.8); border: none;">
+          <template #prefix><icon-search></icon-search></template>
+        </a-input>
 
         <a-input-group>
-          <a-select v-model="form.platform" style="width: 120px; background-color: #f2f3f5; border: none;" placeholder="选择平台">
+          <a-select v-model="form.platform" style="width: 120px; background-color: rgba(242, 243, 245, 0.8); border: none;" placeholder="选择平台">
             <a-option value="Douyin">抖音 (Douyin)</a-option>
             <a-option value="Kuaishou">快手 (Kuaishou)</a-option>
             <a-option value="Soop">Soop</a-option>
           </a-select>
-          <a-input v-model="form.url" placeholder="直播间链接 (http...)" style="width: 300px; background-color: #f2f3f5; border: none;" allow-clear @press-enter="handleAdd"></a-input>
+          <a-input v-model="form.url" placeholder="直播间链接 (http...)" style="width: 300px; background-color: rgba(242, 243, 245, 0.8); border: none;" allow-clear @press-enter="handleAdd"></a-input>
         </a-input-group>
 
         <a-button type="primary" status="success" @click="handleAdd" :loading="adding">
@@ -103,12 +131,29 @@
           <template #icon><icon-copy></icon-copy></template> 批量
         </a-button>
 
+        <div style="display: flex; align-items: center; gap: 8px; background-color: rgba(242, 243, 245, 0.8); padding: 4px 12px; border-radius: 4px; height: 32px; box-sizing: border-box;">
+          <span style="font-size: 13px; font-weight: bold; color: #4e5969;">全局监控</span>
+          <a-switch
+                  :model-value="isAllActive"
+                  @change="handleMasterSwitch"
+                  :disabled="tasks.length === 0"
+                  checked-color="#00b42a"
+                  unchecked-color="#f53f3f">
+            <template #checked>ON</template>
+            <template #unchecked>OFF</template>
+          </a-switch>
+        </div>
+
         <a-button type="outline" @click="showSettingsModal = true" style="margin-left: auto;">
           <template #icon><icon-settings></icon-settings></template> 设置
         </a-button>
       </div>
 
       <div class="toolbar-right">
+        <div class="stat-item" :style="{ color: wsConnected ? '#00b42a' : '#f53f3f' }">
+          <span class="status-dot" :class="{ 'is-recording': wsConnected }" :style="{ backgroundColor: wsConnected ? '#00b42a' : '#f53f3f' }"></span>
+          {{ wsConnected ? '已连接' : '连接中断' }}
+        </div>
         <div class="stat-item">
           <icon-menu></icon-menu> 总计: <span class="stat-num">{{ tasks.length }}</span>
         </div>
@@ -121,65 +166,91 @@
       </div>
     </div>
 
-    <a-table :data="paginatedTasks" :pagination="false" :bordered="false" stripe hoverable>
+    <a-table :data="paginatedTasks" :pagination="false" :bordered="false" stripe hoverable :scroll="{ x: 800 }" size="small">
       <template #empty>
         <a-empty description="暂无监控任务，请在上方添加"></a-empty>
       </template>
 
       <template #columns>
-        <a-table-column title="主播名称" data-index="anchor_name" :width="180">
+        <a-table-column title="主播及画面" data-index="anchor_name" :width="240">
           <template #cell="{ record }">
-            <span style="font-weight: 600; color: #1d2129;">{{ record.anchor_name }}</span>
-            <div v-if="record.status === '初始化中' || record.anchor_name === record.room_id" style="color: #86909c; font-size: 12px; margin-top: 2px;">
-              <icon-loading></icon-loading> 等待引擎抓取...
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <a-image
+                      v-if="record.avatar"
+                      :src="record.avatar"
+                      width="80"
+                      height="45"
+                      fit="cover"
+                      style="border-radius: 4px; flex-shrink: 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1);"
+                      alt="直播画面"
+              >
+                <template #error>
+                  <div style="width: 80px; height: 45px; background: #f2f3f5; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #86909c;">
+                    封面失效
+                  </div>
+                </template>
+              </a-image>
+
+              <div v-else style="width: 80px; height: 45px; background: #f2f3f5; border-radius: 4px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 11px; color: #86909c;">
+                无画面
+              </div>
+
+              <div style="display: flex; flex-direction: column; overflow: hidden; max-width: 130px;">
+                <span style="font-weight: 600; color: #1d2129; line-height: 1.2; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" :title="record.anchor_name">
+                  {{ record.anchor_name }}
+                </span>
+                <div v-if="record.status === '初始化中' || record.anchor_name === record.room_id" style="color: #86909c; font-size: 11px; margin-top: 4px;">
+                  <icon-loading></icon-loading> 等待引擎抓取...
+                </div>
+              </div>
             </div>
           </template>
         </a-table-column>
 
-        <a-table-column title="直播链接">
+        <a-table-column title="直播链接" :width="180">
           <template #cell="{ record }">
             <a :href="getLiveUrl(record.platform, record.room_id)" target="_blank" class="live-link">
-              {{ getLiveUrl(record.platform, record.room_id) }}
+              前往直播间 <icon-launch style="font-size: 10px;"></icon-launch>
             </a>
           </template>
         </a-table-column>
 
-        <a-table-column title="录制状态" :width="280">
+        <a-table-column title="录制状态" :width="220">
           <template #cell="{ record }">
-            <div style="display: flex; align-items: center; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 6px; font-size: 12px;">
               <span class="status-dot" :class="{ 'is-recording': record.status === '录制中' }"></span>
 
               <span :style="{ color: record.status === '录制中' ? '#00b42a' : '#86909c' }">
                 {{ record.status === '录制中' ? '正在录制' : '未在录制' }}
               </span>
 
-              <span v-if="record.status === '录制中'" style="font-size: 12px; color: #86909c;">
+              <span v-if="record.status === '录制中'" style="font-size: 11px; color: #86909c;">
                 (<span style="color: #165dff;">{{ record.duration }}</span> | <span style="color: #ff7d00;">{{ record.file_size }}</span>)
               </span>
             </div>
           </template>
         </a-table-column>
 
-        <a-table-column title="监听状态" :width="160">
+        <a-table-column title="监听状态" :width="120">
           <template #cell="{ record }">
-            <div style="display: flex; align-items: center; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 6px;">
               <a-switch
                       :model-value="!record.is_paused"
                       size="small"
                       :loading="record.switching"
                       @change="(val) => handleSwitch(val, record)">
               </a-switch>
-              <span :style="{ fontSize: '13px', color: !record.is_paused ? '#165dff' : '#86909c' }">
+              <span :style="{ fontSize: '12px', color: !record.is_paused ? '#165dff' : '#86909c' }">
                 {{ !record.is_paused ? '监控中' : '已停止' }}
               </span>
             </div>
           </template>
         </a-table-column>
 
-        <a-table-column title="操作" align="center" :width="100">
+        <a-table-column title="操作" align="center" :width="80">
           <template #cell="{ record }">
-            <a-popconfirm content="确定要删除此任务吗？(本地文件不会丢失)" type="error" @ok="handleControl('delete', record)">
-              <a-button type="text" status="danger" size="small">
+            <a-popconfirm content="确定要删除吗？" type="error" @ok="handleControl('delete', record)">
+              <a-button type="text" status="danger" size="mini">
                 <template #icon><icon-delete></icon-delete></template> 删除
               </a-button>
             </a-popconfirm>
@@ -188,11 +259,12 @@
       </template>
     </a-table>
 
-    <div style="display: flex; justify-content: flex-end; margin-top: 20px;">
+    <div style="display: flex; justify-content: flex-end; margin-top: 12px;">
       <a-pagination
               v-model:current="currentPage"
               v-model:page-size="pageSize"
               :total="sortedTasks.length"
+              size="small"
               show-total
               show-jumper
               show-page-size>
@@ -260,7 +332,6 @@
 
   const App = {
     setup() {
-      // 状态变量
       const searchQuery = ref('');
       const showSettingsModal = ref(false);
       const showBatchModal = ref(false);
@@ -278,9 +349,11 @@
       const batchAdding = ref(false);
       const saving = ref(false);
       const savingCookies = ref(false);
-      let timer = null;
 
-      // 计算属性：搜索 + 置顶排序
+      const wsConnected = ref(false);
+      let ws = null;
+      let wsReconnectTimer = null;
+
       const sortedTasks = computed(() => {
         let list = [...tasks.value];
         if (searchQuery.value) {
@@ -310,6 +383,12 @@
 
       const activeCount = computed(() => tasks.value.filter(t => !t.is_paused).length);
       const recordingCount = computed(() => tasks.value.filter(t => t.status === '录制中').length);
+
+      // 【新增】：用于计算全局开关状态。只要存在一个“未暂停”的任务，它就亮起。
+      const isAllActive = computed(() => {
+        if (tasks.value.length === 0) return false;
+        return tasks.value.some(t => !t.is_paused);
+      });
 
       const getLiveUrl = (platform, roomId) => {
         if (platform === 'Douyin') return `https://live.douyin.com/${roomId}`;
@@ -366,19 +445,49 @@
         finally { savingCookies.value = false; }
       };
 
-      const fetchStatus = async () => {
-        try {
-          const res = await fetch('/api/status');
-          const data = await res.json();
-          // 修复：更新数据时保留正在切换的状态，防止按钮闪烁
-          const currentSwitching = {};
-          tasks.value.forEach(t => { if(t.switching) currentSwitching[`${t.platform}_${t.room_id}`] = true; });
+      const connectWS = () => {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/status`;
 
-          tasks.value = (data || []).map(t => ({
-            ...t,
-            switching: !!currentSwitching[`${t.platform}_${t.room_id}`]
-          }));
-        } catch (e) {}
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          wsConnected.value = true;
+          if (wsReconnectTimer) {
+            clearInterval(wsReconnectTimer);
+            wsReconnectTimer = null;
+          }
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+
+            const currentSwitching = {};
+            tasks.value.forEach(t => {
+              if(t.switching) currentSwitching[`${t.platform}_${t.room_id}`] = true;
+            });
+
+            tasks.value = (data || []).map(t => ({
+              ...t,
+              switching: !!currentSwitching[`${t.platform}_${t.room_id}`]
+            }));
+          } catch (e) {
+            console.error("解析 WebSocket 数据失败", e);
+          }
+        };
+
+        ws.onclose = () => {
+          wsConnected.value = false;
+          if (!wsReconnectTimer) {
+            wsReconnectTimer = setTimeout(connectWS, 3000);
+          }
+        };
+
+        ws.onerror = (err) => {
+          wsConnected.value = false;
+          ws.close();
+        };
       };
 
       const handleAdd = async () => {
@@ -394,7 +503,6 @@
           if (data.code === 0) {
             ArcoVue.Message.success("任务添加成功");
             form.value.url = '';
-            await fetchStatus();
           } else {
             ArcoVue.Message.error(data.msg || "添加失败");
           }
@@ -430,24 +538,15 @@
           ArcoVue.Message.warning(`添加完成，成功 ${success} 个，失败 ${fail} 个`);
           done(true);
         }
-        await fetchStatus();
       };
 
-      // 修复 Switch 开关触发逻辑
       const handleSwitch = async (checked, record) => {
-        // 1. 立即锁定按钮，防止重复点击
         record.switching = true;
         const action = checked ? 'resume' : 'pause';
 
         try {
-          // 2. 发送请求
-          const success = await handleControl(action, record);
-          if (success) {
-            // 3. 乐观更新本地 UI 状态，改善交互感
-            record.is_paused = !checked;
-          }
+          await handleControl(action, record);
         } finally {
-          // 4. 解锁按钮
           record.switching = false;
         }
       };
@@ -466,7 +565,6 @@
           const data = await res.json();
           if (data.code === 0) {
             if (action === 'delete') ArcoVue.Message.success("任务已删除");
-            // 这里不调用 fetchStatus，交给 handleSwitch 统一处理或等待定时器刷新
             return true;
           } else {
             ArcoVue.Message.error(data.msg || "操作失败");
@@ -478,19 +576,48 @@
         }
       };
 
+      // 【新增】：全局主开关控制，替换原先分离的按钮
+      const handleMasterSwitch = async (val) => {
+        const action = val ? 'resume_all' : 'pause_all';
+        const actionName = val ? '全部开启' : '全部暂停';
+        try {
+          const res = await fetch('/api/control_all', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: action })
+          });
+          const data = await res.json();
+          if (data.code === 0) {
+            ArcoVue.Message.success(`已成功执行：${actionName}`);
+            // 乐观更新：在等待 WebSocket 下一次推送前，优先变更本地状态使得界面立马响应
+            tasks.value.forEach(t => {
+              t.is_paused = !val;
+            });
+          } else {
+            ArcoVue.Message.error(`操作失败：${data.msg || '未知错误'}`);
+          }
+        } catch (e) {
+          ArcoVue.Message.error("网络请求失败");
+        }
+      };
+
       onMounted(() => {
         fetchConfigAndCookies();
-        fetchStatus();
-        timer = setInterval(fetchStatus, 3000);
+        connectWS();
       });
-      onUnmounted(() => { if (timer) clearInterval(timer); });
+
+      onUnmounted(() => {
+        if (ws) ws.close();
+        if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+      });
 
       return {
         searchQuery, showSettingsModal, showBatchModal,
         currentPage, pageSize, sortedTasks, paginatedTasks,
-        form, batchForm, settings, cookies, tasks,
+        form, batchForm, settings, cookies, tasks, wsConnected,
         activeCount, recordingCount, adding, batchAdding, saving, savingCookies,
-        getLiveUrl, handleAdd, handleBatchAdd, saveSettings, saveCookies, handleControl, handleSwitch, fetchStatus
+        isAllActive, // 导出全局状态变量
+        getLiveUrl, handleAdd, handleBatchAdd, saveSettings, saveCookies, handleControl, handleSwitch, handleMasterSwitch
       };
     }
   };

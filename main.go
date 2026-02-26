@@ -21,6 +21,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // ==========================================
@@ -54,7 +56,7 @@ type TaskStatus struct {
 	Platform   string `json:"platform"`
 	RoomID     string `json:"room_id"`
 	AnchorName string `json:"anchor_name"`
-	Avatar     string `json:"avatar"` // 新增字段：用于在前端显示真实的头像图片
+	Avatar     string `json:"avatar"` // 用于向前端传递“直播间实时封面图”，变量名保持 avatar 兼容前端
 	Quality    string `json:"quality"`
 	Status     string `json:"status"`
 	UpdateTime string `json:"update_time"`
@@ -77,6 +79,29 @@ var (
 	globalCustomNames sync.Map // 内存中保存的自定义名称 (由 txt 提供)
 )
 
+// ==========================================
+// WebSocket 全局推送通道与配置
+// ==========================================
+var (
+	wsUpgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // 允许所有跨域请求
+		},
+	}
+	wsClients     sync.Map                 // 存储所有已连接的 WebSocket 客户端
+	broadcastChan = make(chan struct{}, 1) // 用于触发全局广播的通道（容量为1，防阻塞）
+)
+
+// triggerBroadcast 触发一次 WebSocket 全局广播推送
+func triggerBroadcast() {
+	select {
+	case broadcastChan <- struct{}{}:
+	default:
+		// 如果通道里已经有一个推送信号还没被消费，就丢弃当前的，防止通道阻塞
+	}
+}
+
+// 更新全局状态，并将画面封面 (Avatar) 更新至内存
 func updateStatus(platform, roomID, anchorName, avatar, quality, statusMsg string) {
 	key := platform + "_" + roomID
 	now := time.Now()
@@ -117,16 +142,18 @@ func updateStatus(platform, roomID, anchorName, avatar, quality, statusMsg strin
 		Platform:   platform,
 		RoomID:     roomID,
 		AnchorName: anchorName,
-		Avatar:     avatar, // 保存头像
+		Avatar:     avatar, // 保存直播间封面
 		Quality:    quality,
 		Status:     statusMsg,
 		UpdateTime: time.Now().Format("2006-01-02 15:04:05"),
 		IsPaused:   isPaused,
 		startTime:  sTime,
 	})
+
+	// ⚡️ 状态一旦更新，立刻通过 WebSocket 推送给所有前端
+	triggerBroadcast()
 }
 
-// Config 已经移除了所有 Json 主播列表相关的字段，完全依赖 urls.txt
 type Config struct {
 	Quality       string `json:"quality"`
 	SegmentTime   int    `json:"segment_time"`
@@ -134,7 +161,6 @@ type Config struct {
 	SavePath      string `json:"save_path"`
 }
 
-// 临时结构体：用于把老旧版本的 Json 数据平滑迁移到 urls.txt
 type OldConfig struct {
 	Douyin      []string          `json:"douyin"`
 	Kuaishou    []string          `json:"kuaishou"`
@@ -165,7 +191,6 @@ func saveConfig() {
 
 var anchorLinesMutex sync.Mutex
 
-// 同步状态到 txt 文本
 func syncAnchorToTxt(action string, platform, roomID string, rawLine string) {
 	anchorLinesMutex.Lock()
 	defer anchorLinesMutex.Unlock()
@@ -215,7 +240,47 @@ func syncAnchorToTxt(action string, platform, roomID string, rawLine string) {
 	os.WriteFile("urls.txt", []byte(strings.Join(newLines, "\n")+"\n"), 0644)
 }
 
-// 智能解析单行文本
+func updateTxtAnchorName(platform, roomID, anchorName string) {
+	if anchorName == "" || anchorName == roomID {
+		return
+	}
+
+	anchorLinesMutex.Lock()
+	defer anchorLinesMutex.Unlock()
+
+	content, err := os.ReadFile("urls.txt")
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(content), "\n")
+	changed := false
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		isP, p, rid, customName, rawURL := parseLine(trimmed)
+		if p == platform && rid == roomID {
+			if customName == "" {
+				prefix := ""
+				if isP {
+					prefix = "#"
+				}
+				lines[i] = fmt.Sprintf("%s%s,主播:%s", prefix, rawURL, anchorName)
+				changed = true
+			}
+			break
+		}
+	}
+
+	if changed {
+		os.WriteFile("urls.txt", []byte(strings.Join(lines, "\n")+"\n"), 0644)
+	}
+}
+
 func parseLine(line string) (isPaused bool, platform string, roomID string, customName string, rawURL string) {
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -227,7 +292,6 @@ func parseLine(line string) (isPaused bool, platform string, roomID string, cust
 		line = strings.TrimSpace(strings.TrimPrefix(line, "#"))
 	}
 
-	// 提取自定义名字
 	if idx := strings.Index(line, ",主播:"); idx != -1 {
 		customName = strings.TrimSpace(line[idx+len(",主播:"):])
 		rawURL = strings.TrimSpace(line[:idx])
@@ -241,7 +305,6 @@ func parseLine(line string) (isPaused bool, platform string, roomID string, cust
 		rawURL = line
 	}
 
-	// 识别平台
 	if strings.Contains(rawURL, "douyin.com") {
 		platform = "Douyin"
 	} else if strings.Contains(rawURL, "kuaishou.com") {
@@ -687,6 +750,66 @@ func formatQualityName(quality string) string {
 }
 
 // ==========================================
+// 🚀 核心升级：实时提取视频画面的定时器机制
+// ==========================================
+
+// captureLiveCover 单次触发 ffmpeg 提取一帧并覆盖文件
+func captureLiveCover(platform, roomID, streamURL string) {
+	// 设置 10 秒超时，防止卡死
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	coverDir := filepath.Join(".", "covers")
+	os.MkdirAll(coverDir, os.ModePerm)
+
+	fileName := fmt.Sprintf("%s_%s.jpg", platform, roomID)
+	coverPath := filepath.Join(coverDir, fileName)
+
+	// -vframes 1: 提取1帧
+	// -q:v 2: 较高质量的JPEG
+	cmd := exec.CommandContext(ctx, ffmpegPath, "-y",
+		"-analyzeduration", "1000000",
+		"-probesize", "1000000",
+		"-i", streamURL,
+		"-vframes", "1",
+		"-q:v", "2",
+		coverPath)
+
+	if err := cmd.Run(); err == nil {
+		key := platform + "_" + roomID
+		if existing, ok := globalStatus.Load(key); ok {
+			task := existing.(*TaskStatus)
+			// 追加微秒级时间戳，强制前端立刻刷新并无视浏览器缓存
+			task.Avatar = fmt.Sprintf("/covers/%s?t=%d", fileName, time.Now().UnixMilli())
+			globalStatus.Store(key, task)
+
+			// ⚡️ 画面更新后，立即触发 WebSocket 推送
+			triggerBroadcast()
+		}
+	}
+}
+
+// updateLiveCoverLoop 只要在录制中，每隔 20 秒就提取一次最新画面 (伪实时)
+func updateLiveCoverLoop(ctx context.Context, platform, roomID, streamURL string) {
+	// 第一时间先截取一张给用户看
+	captureLiveCover(platform, roomID, streamURL)
+
+	// 设置 20 秒定时器，不断刷新画面。这个间隔对 CPU 非常友好。
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// 录制结束或断流时，停止刷新
+			return
+		case <-ticker.C:
+			captureLiveCover(platform, roomID, streamURL)
+		}
+	}
+}
+
+// ==========================================
 // 抖音平台实现部分
 // ==========================================
 
@@ -754,7 +877,7 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 			User struct {
 				Nickname    string `json:"nickname"`
 				AvatarThumb struct {
-					UrlList []string `json:"url_list"` // 新增：提取头像
+					UrlList []string `json:"url_list"`
 				} `json:"avatar_thumb"`
 			} `json:"user"`
 		} `json:"data"`
@@ -767,9 +890,13 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 
 	roomData := data.Data.Data[0]
 	anchorName := data.Data.User.Nickname
-
 	avatar := ""
-	if len(data.Data.User.AvatarThumb.UrlList) > 0 {
+
+	// 抓取接口封面作为前几秒的缓冲占位，等到 FFmpeg 截取到了高清实时帧，就会把它替换掉
+	coverRe := regexp.MustCompile(`(?s)"(?:dynamic_cover|cover|room_cover)"\s*:\s*\{[^}]*"url_list"\s*:\s*\[\s*"([^"]+)"`)
+	if m := coverRe.FindSubmatch(body); len(m) >= 2 {
+		avatar = strings.ReplaceAll(string(m[1]), `\u002F`, "/")
+	} else if len(data.Data.User.AvatarThumb.UrlList) > 0 {
 		avatar = data.Data.User.AvatarThumb.UrlList[0]
 	}
 
@@ -844,13 +971,13 @@ func (k *KuaishouPlatform) GetStreamURL(roomID string, quality string) (string, 
 	}
 
 	avatar := ""
-	avatarRe := regexp.MustCompile(`"headUrl":"([^"]+)"`)
-	if m := avatarRe.FindStringSubmatch(htmlStr); len(m) >= 2 {
-		avatar = strings.ReplaceAll(m[1], `\u002F`, "/")
+	posterRe := regexp.MustCompile(`"(?:poster|coverUrl|livePoster)"\s*:\s*"([^"]+)"`)
+	if m := posterRe.FindSubmatch(body); len(m) >= 2 {
+		avatar = strings.ReplaceAll(string(m[1]), `\u002F`, "/")
 	} else {
-		avatarRe2 := regexp.MustCompile(`"avatar":"([^"]+)"`)
-		if m2 := avatarRe2.FindStringSubmatch(htmlStr); len(m2) >= 2 {
-			avatar = strings.ReplaceAll(m2[1], `\u002F`, "/")
+		avatarRe := regexp.MustCompile(`"(?:headUrl|avatar)"\s*:\s*"([^"]+)"`)
+		if m := avatarRe.FindSubmatch(body); len(m) >= 2 {
+			avatar = strings.ReplaceAll(string(m[1]), `\u002F`, "/")
 		}
 	}
 
@@ -1100,7 +1227,6 @@ func MonitorLive(p Platform, roomID string) {
 	platformName := p.GetPlatformName()
 	key := platformName + "_" + roomID
 
-	// 此处保持为空，稍后会在循环中通过 txt 记忆的数据覆盖
 	taskStates.Store(key, "running")
 	log.Printf("👀 [启动监控] %s 房间: %s", platformName, roomID)
 	updateStatus(platformName, roomID, "", "", "-", "监控中")
@@ -1151,7 +1277,16 @@ func MonitorLive(p Platform, roomID string) {
 			}
 		} else if url != "" {
 			updateStatus(platformName, roomID, name, avatar, q, "录制中")
+
+			// ✨ 核心调用：在开始录制时，同时启动“伪实时画面刷新协程”
+			coverCtx, coverCancel := context.WithCancel(context.Background())
+			go updateLiveCoverLoop(coverCtx, platformName, roomID, url)
+
+			// 阻塞开始录制
 			RecordStream(ctx, url, platformName, roomID, name, avatar, q, st)
+
+			// 录制结束或断流了，立刻停止截帧
+			coverCancel()
 
 			state, _ = taskStates.Load(key)
 			if state != "deleted" && state != "paused" {
@@ -1203,6 +1338,86 @@ func startMonitorIfNotRunning(p Platform, roomID string) {
 	}
 	activeTasks.Store(key, true)
 	go MonitorLive(p, roomID)
+}
+
+// ==========================================
+// WebSocket 服务与广播核心逻辑
+// ==========================================
+
+func doBroadcast() {
+	var list []TaskStatus
+	globalStatus.Range(func(key, value interface{}) bool {
+		task := *value.(*TaskStatus)
+
+		if task.Status == "录制中" && !task.startTime.IsZero() {
+			task.Duration = formatDuration(time.Since(task.startTime))
+		} else {
+			task.Duration = "-"
+		}
+
+		safeName := sanitizeFileName(task.AnchorName)
+		if safeName == "" {
+			safeName = task.RoomID
+		}
+		baseDir := globalConfig.SavePath
+		if baseDir == "" {
+			baseDir = "./downloads"
+		}
+		targetDir := filepath.Join(baseDir, safeName)
+		task.FileSize = getDirSizeStr(targetDir)
+
+		list = append(list, task)
+		return true
+	})
+
+	wsClients.Range(func(key, value interface{}) bool {
+		conn := key.(*websocket.Conn)
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if err := conn.WriteJSON(list); err != nil {
+			conn.Close()
+			wsClients.Delete(key)
+		}
+		return true
+	})
+}
+
+func broadcastStatusLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	for {
+		select {
+		case <-ticker.C:
+			doBroadcast()
+		case <-broadcastChan:
+			time.Sleep(50 * time.Millisecond) // 防抖
+			doBroadcast()
+			select {
+			case <-broadcastChan:
+			default:
+			}
+		}
+	}
+}
+
+func handleWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("WebSocket升级失败:", err)
+		return
+	}
+
+	wsClients.Store(conn, true)
+	triggerBroadcast()
+
+	defer func() {
+		conn.Close()
+		wsClients.Delete(conn)
+	}()
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
 }
 
 // ==========================================
@@ -1285,7 +1500,6 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 	var d struct{ Platform, URL string }
 	json.NewDecoder(r.Body).Decode(&d)
 
-	// 后端支持解析文本框传来的大量行
 	lines := strings.Split(d.URL, "\n")
 
 	for _, line := range lines {
@@ -1301,7 +1515,6 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 容错：如果解析不出平台，就用前端传来的兜底平台
 		if platformName == "" {
 			platformName = d.Platform
 		}
@@ -1312,7 +1525,6 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 			globalCustomNames.Store(key, customName)
 		}
 
-		// 如果内存中已存在此任务，忽略它
 		if _, exists := activeTasks.Load(key); exists {
 			continue
 		}
@@ -1332,7 +1544,6 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 同步存入 urls.txt 文件
 		syncAnchorToTxt("add", platformName, roomID, rawURL)
 
 		displayName := customName
@@ -1349,6 +1560,7 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	triggerBroadcast()
 	w.Write([]byte(`{"code":0}`))
 }
 
@@ -1373,9 +1585,36 @@ func apiControl(w http.ResponseWriter, r *http.Request) {
 		}
 		syncAnchorToTxt("pause", req.Platform, req.RoomID, "")
 
+		if existing, ok := globalStatus.Load(key); ok {
+			task := existing.(*TaskStatus)
+			task.IsPaused = true
+			task.Status = "已暂停"
+			globalStatus.Store(key, task)
+		}
+
 	case "resume":
 		taskStates.Store(key, "running")
 		syncAnchorToTxt("resume", req.Platform, req.RoomID, "")
+
+		if existing, ok := globalStatus.Load(key); ok {
+			task := existing.(*TaskStatus)
+			task.IsPaused = false
+			task.Status = "监控中"
+			globalStatus.Store(key, task)
+		}
+
+		var p Platform
+		switch req.Platform {
+		case "Douyin":
+			p = &DouyinPlatform{}
+		case "Kuaishou":
+			p = &KuaishouPlatform{}
+		case "Soop":
+			p = &SoopPlatform{}
+		}
+		if p != nil {
+			startMonitorIfNotRunning(p, req.RoomID)
+		}
 
 	case "delete":
 		taskStates.Store(key, "deleted")
@@ -1383,17 +1622,100 @@ func apiControl(w http.ResponseWriter, r *http.Request) {
 			cancel.(context.CancelFunc)()
 		}
 		syncAnchorToTxt("delete", req.Platform, req.RoomID, "")
-		globalStatus.Delete(key) // 立即在前端移除
+		globalStatus.Delete(key)
 		activeTasks.Delete(key)
 	}
 
+	triggerBroadcast()
+	w.Write([]byte(`{"code":0}`))
+}
+
+// ==========================================
+// 🚀 一键批量控制接口 (全部开启 / 全部暂停)
+// ==========================================
+func apiControlAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		return
+	}
+	var req struct {
+		Action string `json:"action"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	anchorLinesMutex.Lock()
+	content, err := os.ReadFile("urls.txt")
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		var newLines []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if req.Action == "pause_all" {
+				if !strings.HasPrefix(trimmed, "#") {
+					newLines = append(newLines, "#"+trimmed)
+				} else {
+					newLines = append(newLines, trimmed)
+				}
+			} else if req.Action == "resume_all" {
+				if strings.HasPrefix(trimmed, "#") {
+					newLines = append(newLines, strings.TrimSpace(strings.TrimPrefix(trimmed, "#")))
+				} else {
+					newLines = append(newLines, trimmed)
+				}
+			}
+		}
+		os.WriteFile("urls.txt", []byte(strings.Join(newLines, "\n")+"\n"), 0644)
+	}
+	anchorLinesMutex.Unlock()
+
+	globalStatus.Range(func(key, value interface{}) bool {
+		task := value.(*TaskStatus)
+		parts := strings.SplitN(key.(string), "_", 2)
+		if len(parts) != 2 {
+			return true
+		}
+		platform, roomID := parts[0], parts[1]
+
+		if req.Action == "pause_all" {
+			taskStates.Store(key, "paused")
+			if cancel, ok := activeCancels.Load(key); ok {
+				cancel.(context.CancelFunc)()
+			}
+			task.IsPaused = true
+			task.Status = "已暂停"
+			globalStatus.Store(key, task)
+
+		} else if req.Action == "resume_all" {
+			taskStates.Store(key, "running")
+			task.IsPaused = false
+			task.Status = "监控中"
+			globalStatus.Store(key, task)
+
+			var p Platform
+			switch platform {
+			case "Douyin":
+				p = &DouyinPlatform{}
+			case "Kuaishou":
+				p = &KuaishouPlatform{}
+			case "Soop":
+				p = &SoopPlatform{}
+			}
+			if p != nil {
+				startMonitorIfNotRunning(p, roomID)
+			}
+		}
+		return true
+	})
+
+	triggerBroadcast()
 	w.Write([]byte(`{"code":0}`))
 }
 
 func main() {
 	checkFFmpeg()
 
-	// 1. 读取基础设置 config.json
 	if _, err := os.Stat("config.json"); os.IsNotExist(err) {
 		globalConfig = &Config{Quality: "uhd", CheckInterval: 30, SavePath: "./downloads"}
 		saveConfig()
@@ -1410,7 +1732,6 @@ func main() {
 		globalConfig.SavePath = "./downloads"
 	}
 
-	// 平滑过度旧版本数据到 urls.txt
 	if _, err := os.Stat("urls.txt"); os.IsNotExist(err) {
 		d, err2 := os.ReadFile("config.json")
 		if err2 == nil {
@@ -1480,7 +1801,6 @@ func main() {
 		}
 	}
 
-	// 2. 读取 Cookie
 	if _, err := os.Stat("cookies.json"); os.IsNotExist(err) {
 		globalCookies = &CookieConfig{}
 		d, _ := json.MarshalIndent(globalCookies, "", "    ")
@@ -1491,7 +1811,6 @@ func main() {
 		json.Unmarshal(d, globalCookies)
 	}
 
-	// 3. 核心：从 urls.txt 启动任务！
 	content, err := os.ReadFile("urls.txt")
 	if err == nil {
 		lines := strings.Split(string(content), "\n")
@@ -1537,11 +1856,9 @@ func main() {
 			}
 		}
 	} else {
-		// 如果不存在，创建空的 urls.txt
 		os.WriteFile("urls.txt", []byte(""), 0644)
 	}
 
-	// 4. 信号拦截与优雅退出
 	stopSignal := make(chan os.Signal, 1)
 	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -1558,8 +1875,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Println("🚀 服务已启动，监听端口 9091")
-	log.Println("👉 请自行查看本机 IP 访问，或尝试: http://localhost:9091")
+	os.MkdirAll("./covers", os.ModePerm)
+	http.Handle("/covers/", http.StripPrefix("/covers/", http.FileServer(http.Dir("./covers"))))
 
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/api/config", apiConfig)
@@ -1567,6 +1884,14 @@ func main() {
 	http.HandleFunc("/api/status", apiStatus)
 	http.HandleFunc("/api/add", apiAdd)
 	http.HandleFunc("/api/control", apiControl)
+
+	http.HandleFunc("/api/control_all", apiControlAll)
+
+	http.HandleFunc("/ws/status", handleWS)
+	go broadcastStatusLoop()
+
+	log.Println("🚀 服务已启动，监听端口 9091")
+	log.Println("👉 请自行查看本机 IP 访问，或尝试: http://localhost:9091")
 
 	if err := http.ListenAndServe(":9091", nil); err != nil {
 		log.Fatalf("Web服务启动失败: %v", err)
