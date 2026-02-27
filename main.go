@@ -21,6 +21,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // ==========================================
@@ -54,6 +56,7 @@ type TaskStatus struct {
 	Platform   string `json:"platform"`
 	RoomID     string `json:"room_id"`
 	AnchorName string `json:"anchor_name"`
+	Avatar     string `json:"avatar"` // 用于向前端传递“直播间实时封面图”，变量名保持 avatar 兼容前端
 	Quality    string `json:"quality"`
 	Status     string `json:"status"`
 	UpdateTime string `json:"update_time"`
@@ -61,7 +64,7 @@ type TaskStatus struct {
 	FileSize   string `json:"file_size"`
 	Duration   string `json:"duration"`
 
-	startTime time.Time `json:"-"` // 内部私有字段：用于记录本次录制开始的绝对时间戳
+	startTime time.Time `json:"-"`
 }
 
 var (
@@ -71,11 +74,35 @@ var (
 	globalCookies *CookieConfig
 	cookieMutex   sync.RWMutex
 
-	taskStates    sync.Map // key: platform_roomID, value: "running", "paused", "deleted"
-	activeCancels sync.Map // key: platform_roomID, value: context.CancelFunc
+	taskStates        sync.Map // key: platform_roomID, value: "running", "paused", "deleted"
+	activeCancels     sync.Map // key: platform_roomID, value: context.CancelFunc
+	globalCustomNames sync.Map // 内存中保存的自定义名称 (由 txt 提供)
 )
 
-func updateStatus(platform, roomID, anchorName, quality, statusMsg string) {
+// ==========================================
+// WebSocket 全局推送通道与配置
+// ==========================================
+var (
+	wsUpgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // 允许所有跨域请求
+		},
+	}
+	wsClients     sync.Map                 // 存储所有已连接的 WebSocket 客户端
+	broadcastChan = make(chan struct{}, 1) // 用于触发全局广播的通道（容量为1，防阻塞）
+)
+
+// triggerBroadcast 触发一次 WebSocket 全局广播推送
+func triggerBroadcast() {
+	select {
+	case broadcastChan <- struct{}{}:
+	default:
+		// 如果通道里已经有一个推送信号还没被消费，就丢弃当前的，防止通道阻塞
+	}
+}
+
+// 更新全局状态，并将画面封面 (Avatar) 更新至内存
+func updateStatus(platform, roomID, anchorName, avatar, quality, statusMsg string) {
 	key := platform + "_" + roomID
 	now := time.Now()
 	var sTime time.Time
@@ -84,6 +111,9 @@ func updateStatus(platform, roomID, anchorName, quality, statusMsg string) {
 		oldTask := existing.(*TaskStatus)
 		if anchorName == "" {
 			anchorName = oldTask.AnchorName
+		}
+		if avatar == "" {
+			avatar = oldTask.Avatar
 		}
 		if statusMsg == "录制中" {
 			if oldTask.Status != "录制中" {
@@ -112,23 +142,31 @@ func updateStatus(platform, roomID, anchorName, quality, statusMsg string) {
 		Platform:   platform,
 		RoomID:     roomID,
 		AnchorName: anchorName,
+		Avatar:     avatar, // 保存直播间封面
 		Quality:    quality,
 		Status:     statusMsg,
 		UpdateTime: time.Now().Format("2006-01-02 15:04:05"),
 		IsPaused:   isPaused,
 		startTime:  sTime,
 	})
+
+	// ⚡️ 状态一旦更新，立刻通过 WebSocket 推送给所有前端
+	triggerBroadcast()
 }
 
 type Config struct {
-	Douyin        []string `json:"douyin"`
-	Kuaishou      []string `json:"kuaishou"`
-	Soop          []string `json:"soop"`
-	Quality       string   `json:"quality"`
-	SegmentTime   int      `json:"segment_time"`
-	CheckInterval int      `json:"check_interval"`
-	SavePath      string   `json:"save_path"`
-	PausedTasks   []string `json:"paused_tasks"` // 持久化保存被暂停任务的 Key 列表
+	Quality       string `json:"quality"`
+	SegmentTime   int    `json:"segment_time"`
+	CheckInterval int    `json:"check_interval"`
+	SavePath      string `json:"save_path"`
+}
+
+type OldConfig struct {
+	Douyin      []string          `json:"douyin"`
+	Kuaishou    []string          `json:"kuaishou"`
+	Soop        []string          `json:"soop"`
+	PausedTasks []string          `json:"paused_tasks"`
+	CustomNames map[string]string `json:"custom_names"`
 }
 
 type CookieConfig struct {
@@ -139,37 +177,144 @@ type CookieConfig struct {
 
 type Platform interface {
 	GetPlatformName() string
-	GetStreamURL(roomID string, quality string) (streamURL string, anchorName string, err error)
+	GetStreamURL(roomID string, quality string) (streamURL string, anchorName string, avatar string, err error)
 }
-
-// ==========================================
-// 统一的配置读写辅助函数
-// ==========================================
 
 func saveConfig() {
 	data, _ := json.MarshalIndent(globalConfig, "", "    ")
 	os.WriteFile("config.json", data, 0644)
 }
 
-func addPausedTask(key string) {
-	for _, k := range globalConfig.PausedTasks {
-		if k == key {
-			return
+// ==========================================
+// 文本存储同步核心逻辑 (urls.txt)
+// ==========================================
+
+var anchorLinesMutex sync.Mutex
+
+func syncAnchorToTxt(action string, platform, roomID string, rawLine string) {
+	anchorLinesMutex.Lock()
+	defer anchorLinesMutex.Unlock()
+
+	content, err := os.ReadFile("urls.txt")
+	var lines []string
+	if err == nil {
+		lines = strings.Split(string(content), "\n")
+	}
+
+	var newLines []string
+	found := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		isP, p, rid, _, _ := parseLine(trimmed)
+		if p == platform && rid == roomID {
+			found = true
+			if action == "delete" {
+				continue // 丢弃这一行
+			} else if action == "pause" {
+				if !isP {
+					newLines = append(newLines, "#"+trimmed)
+				} else {
+					newLines = append(newLines, trimmed)
+				}
+			} else if action == "resume" {
+				if isP {
+					newLines = append(newLines, strings.TrimSpace(strings.TrimPrefix(trimmed, "#")))
+				} else {
+					newLines = append(newLines, trimmed)
+				}
+			}
+		} else {
+			newLines = append(newLines, trimmed)
 		}
 	}
-	globalConfig.PausedTasks = append(globalConfig.PausedTasks, key)
-	saveConfig()
+
+	if !found && action == "add" && rawLine != "" {
+		newLines = append(newLines, strings.TrimSpace(rawLine))
+	}
+
+	os.WriteFile("urls.txt", []byte(strings.Join(newLines, "\n")+"\n"), 0644)
 }
 
-func removePausedTask(key string) {
-	var res []string
-	for _, k := range globalConfig.PausedTasks {
-		if k != key {
-			res = append(res, k)
+func updateTxtAnchorName(platform, roomID, anchorName string) {
+	if anchorName == "" || anchorName == roomID {
+		return
+	}
+
+	anchorLinesMutex.Lock()
+	defer anchorLinesMutex.Unlock()
+
+	content, err := os.ReadFile("urls.txt")
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(content), "\n")
+	changed := false
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		isP, p, rid, customName, rawURL := parseLine(trimmed)
+		if p == platform && rid == roomID {
+			if customName == "" {
+				prefix := ""
+				if isP {
+					prefix = "#"
+				}
+				lines[i] = fmt.Sprintf("%s%s,主播:%s", prefix, rawURL, anchorName)
+				changed = true
+			}
+			break
 		}
 	}
-	globalConfig.PausedTasks = res
-	saveConfig()
+
+	if changed {
+		os.WriteFile("urls.txt", []byte(strings.Join(lines, "\n")+"\n"), 0644)
+	}
+}
+
+func parseLine(line string) (isPaused bool, platform string, roomID string, customName string, rawURL string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+
+	if strings.HasPrefix(line, "#") {
+		isPaused = true
+		line = strings.TrimSpace(strings.TrimPrefix(line, "#"))
+	}
+
+	if idx := strings.Index(line, ",主播:"); idx != -1 {
+		customName = strings.TrimSpace(line[idx+len(",主播:"):])
+		rawURL = strings.TrimSpace(line[:idx])
+	} else if idx := strings.Index(line, ", 主播:"); idx != -1 {
+		customName = strings.TrimSpace(line[idx+len(", 主播:"):])
+		rawURL = strings.TrimSpace(line[:idx])
+	} else if idx := strings.Index(line, ","); idx != -1 {
+		customName = strings.TrimSpace(line[idx+1:])
+		rawURL = strings.TrimSpace(line[:idx])
+	} else {
+		rawURL = line
+	}
+
+	if strings.Contains(rawURL, "douyin.com") {
+		platform = "Douyin"
+	} else if strings.Contains(rawURL, "kuaishou.com") {
+		platform = "Kuaishou"
+	} else if strings.Contains(rawURL, "sooplive.co.kr") || strings.Contains(rawURL, "afreecatv.com") {
+		platform = "Soop"
+	}
+
+	roomID = extractRoomID(rawURL)
+	return
 }
 
 // ==========================================
@@ -605,6 +750,66 @@ func formatQualityName(quality string) string {
 }
 
 // ==========================================
+// 🚀 核心升级：实时提取视频画面的定时器机制
+// ==========================================
+
+// captureLiveCover 单次触发 ffmpeg 提取一帧并覆盖文件
+func captureLiveCover(platform, roomID, streamURL string) {
+	// 设置 10 秒超时，防止卡死
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	coverDir := filepath.Join(".", "covers")
+	os.MkdirAll(coverDir, os.ModePerm)
+
+	fileName := fmt.Sprintf("%s_%s.jpg", platform, roomID)
+	coverPath := filepath.Join(coverDir, fileName)
+
+	// -vframes 1: 提取1帧
+	// -q:v 2: 较高质量的JPEG
+	cmd := exec.CommandContext(ctx, ffmpegPath, "-y",
+		"-analyzeduration", "1000000",
+		"-probesize", "1000000",
+		"-i", streamURL,
+		"-vframes", "1",
+		"-q:v", "2",
+		coverPath)
+
+	if err := cmd.Run(); err == nil {
+		key := platform + "_" + roomID
+		if existing, ok := globalStatus.Load(key); ok {
+			task := existing.(*TaskStatus)
+			// 追加微秒级时间戳，强制前端立刻刷新并无视浏览器缓存
+			task.Avatar = fmt.Sprintf("/covers/%s?t=%d", fileName, time.Now().UnixMilli())
+			globalStatus.Store(key, task)
+
+			// ⚡️ 画面更新后，立即触发 WebSocket 推送
+			triggerBroadcast()
+		}
+	}
+}
+
+// updateLiveCoverLoop 只要在录制中，每隔 20 秒就提取一次最新画面 (伪实时)
+func updateLiveCoverLoop(ctx context.Context, platform, roomID, streamURL string) {
+	// 第一时间先截取一张给用户看
+	captureLiveCover(platform, roomID, streamURL)
+
+	// 设置 20 秒定时器，不断刷新画面。这个间隔对 CPU 非常友好。
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// 录制结束或断流时，停止刷新
+			return
+		case <-ticker.C:
+			captureLiveCover(platform, roomID, streamURL)
+		}
+	}
+}
+
+// ==========================================
 // 抖音平台实现部分
 // ==========================================
 
@@ -612,7 +817,7 @@ type DouyinPlatform struct{}
 
 func (d *DouyinPlatform) GetPlatformName() string { return "Douyin" }
 
-func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, string, error) {
+func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, string, string, error) {
 	params := url.Values{}
 	params.Set("aid", "6383")
 	params.Set("app_name", "douyin_web")
@@ -633,7 +838,7 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	cookieMutex.RLock()
@@ -651,13 +856,13 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 
 	resp, err := globalHTTPClient.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	var data struct {
@@ -670,20 +875,33 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 				} `json:"stream_url"`
 			} `json:"data"`
 			User struct {
-				Nickname string `json:"nickname"`
+				Nickname    string `json:"nickname"`
+				AvatarThumb struct {
+					UrlList []string `json:"url_list"`
+				} `json:"avatar_thumb"`
 			} `json:"user"`
 		} `json:"data"`
 	}
 
 	json.Unmarshal(body, &data)
 	if len(data.Data.Data) == 0 {
-		return "", "", nil
+		return "", "", "", nil
 	}
 
 	roomData := data.Data.Data[0]
 	anchorName := data.Data.User.Nickname
+	avatar := ""
+
+	// 抓取接口封面作为前几秒的缓冲占位，等到 FFmpeg 截取到了高清实时帧，就会把它替换掉
+	coverRe := regexp.MustCompile(`(?s)"(?:dynamic_cover|cover|room_cover)"\s*:\s*\{[^}]*"url_list"\s*:\s*\[\s*"([^"]+)"`)
+	if m := coverRe.FindSubmatch(body); len(m) >= 2 {
+		avatar = strings.ReplaceAll(string(m[1]), `\u002F`, "/")
+	} else if len(data.Data.User.AvatarThumb.UrlList) > 0 {
+		avatar = data.Data.User.AvatarThumb.UrlList[0]
+	}
+
 	if roomData.Status != 2 {
-		return "", anchorName, nil
+		return "", anchorName, avatar, nil
 	}
 
 	var streamURL string
@@ -704,7 +922,7 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 			break
 		}
 	}
-	return streamURL, anchorName, nil
+	return streamURL, anchorName, avatar, nil
 }
 
 // ==========================================
@@ -714,11 +932,11 @@ func (d *DouyinPlatform) GetStreamURL(roomID string, quality string) (string, st
 type KuaishouPlatform struct{}
 
 func (k *KuaishouPlatform) GetPlatformName() string { return "Kuaishou" }
-func (k *KuaishouPlatform) GetStreamURL(roomID string, quality string) (string, string, error) {
+func (k *KuaishouPlatform) GetStreamURL(roomID string, quality string) (string, string, string, error) {
 	reqURL := fmt.Sprintf("https://live.kuaishou.com/u/%s", roomID)
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -733,13 +951,13 @@ func (k *KuaishouPlatform) GetStreamURL(roomID string, quality string) (string, 
 
 	resp, err := globalHTTPClient.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	htmlStr := string(body)
 
@@ -752,10 +970,21 @@ func (k *KuaishouPlatform) GetStreamURL(roomID string, quality string) (string, 
 		}
 	}
 
+	avatar := ""
+	posterRe := regexp.MustCompile(`"(?:poster|coverUrl|livePoster)"\s*:\s*"([^"]+)"`)
+	if m := posterRe.FindSubmatch(body); len(m) >= 2 {
+		avatar = strings.ReplaceAll(string(m[1]), `\u002F`, "/")
+	} else {
+		avatarRe := regexp.MustCompile(`"(?:headUrl|avatar)"\s*:\s*"([^"]+)"`)
+		if m := avatarRe.FindSubmatch(body); len(m) >= 2 {
+			avatar = strings.ReplaceAll(string(m[1]), `\u002F`, "/")
+		}
+	}
+
 	re := regexp.MustCompile(`window\.__INITIAL_STATE__=({.*?});\(function`)
 	matches := re.FindSubmatch(body)
 	if len(matches) < 2 {
-		return "", anchorName, fmt.Errorf("无法获取快手数据")
+		return "", anchorName, avatar, fmt.Errorf("无法获取快手数据")
 	}
 
 	streamRe := regexp.MustCompile(`"url":"([^"]+\.flv[^"]*)"`)
@@ -765,9 +994,9 @@ func (k *KuaishouPlatform) GetStreamURL(roomID string, quality string) (string, 
 		if quality == "sd" {
 			idx = len(streamMatches) - 1
 		}
-		return strings.ReplaceAll(streamMatches[idx][1], `\u0026`, "&"), anchorName, nil
+		return strings.ReplaceAll(streamMatches[idx][1], `\u0026`, "&"), anchorName, avatar, nil
 	}
-	return "", anchorName, nil
+	return "", anchorName, avatar, nil
 }
 
 // ==========================================
@@ -778,7 +1007,7 @@ type SoopPlatform struct{}
 
 func (s *SoopPlatform) GetPlatformName() string { return "Soop" }
 
-func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, string, error) {
+func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, string, string, error) {
 	apiURL := "http://api.m.sooplive.co.kr/broad/a/watch"
 	formData := url.Values{}
 	formData.Set("bj_id", roomID)
@@ -790,7 +1019,7 @@ func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, stri
 
 	req, err := http.NewRequest("POST", apiURL, strings.NewReader(formData.Encode()))
 	if err != nil {
-		return "", roomID, err
+		return "", roomID, "", err
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -807,18 +1036,18 @@ func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, stri
 
 	resp, err := globalHTTPClient.Do(req)
 	if err != nil {
-		return "", roomID, err
+		return "", roomID, "", err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", roomID, err
+		return "", roomID, "", err
 	}
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", roomID, fmt.Errorf("JSON 解析失败: %v", err)
+		return "", roomID, "", fmt.Errorf("JSON 解析失败: %v", err)
 	}
 
 	dataMap, _ := result["data"].(map[string]interface{})
@@ -839,15 +1068,22 @@ func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, stri
 		if dataMap != nil {
 			if code, ok := dataMap["code"].(float64); ok {
 				if code == -6001 {
-					return "", anchorName, nil
+					return "", anchorName, "", nil
 				} else if code == -3001 {
-					return "", anchorName, nil
+					return "", anchorName, "", nil
 				} else if code == -3002 || code == -3004 {
-					return "", anchorName, fmt.Errorf("该直播需要19+登录或验证，请在配置中提供对应 Cookie (code: %v)", code)
+					return "", anchorName, "", fmt.Errorf("该直播需要19+登录或验证，请在配置中提供对应 Cookie (code: %v)", code)
 				}
 			}
 		}
-		return "", anchorName, fmt.Errorf("未知异常或开播请求失败。原始响应: %s", string(body))
+		return "", anchorName, "", fmt.Errorf("未知异常或开播请求失败")
+	}
+
+	avatar := ""
+	if dataMap != nil {
+		if bjID, ok := dataMap["bj_id"].(string); ok && len(bjID) >= 2 {
+			avatar = fmt.Sprintf("https://stimg.afreecatv.com/LOGO/%s/%s/%s.jpg", bjID[:2], bjID, bjID)
+		}
 	}
 
 	broadNoStr := ""
@@ -863,54 +1099,53 @@ func (s *SoopPlatform) GetStreamURL(roomID string, quality string) (string, stri
 	}
 
 	if broadNoStr == "" || aid == "" {
-		return "", anchorName, fmt.Errorf("提取 broad_no 或 aid 失败")
+		return "", anchorName, avatar, fmt.Errorf("提取 broad_no 或 aid 失败")
 	}
 
 	cdnURL := fmt.Sprintf("http://livestream-manager.sooplive.co.kr/broad_stream_assign.html?return_type=gcp_cdn&use_cors=false&cors_origin_url=play.sooplive.co.kr&broad_key=%s-common-master-hls&time=8361.086329376785", broadNoStr)
 
 	reqCdn, err := http.NewRequest("GET", cdnURL, nil)
 	if err != nil {
-		return "", anchorName, err
+		return "", anchorName, avatar, err
 	}
 
-	reqCdn.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0")
+	reqCdn.Header.Set("User-Agent", "Mozilla/5.0")
 	reqCdn.Header.Set("Origin", "https://play.sooplive.co.kr")
 	reqCdn.Header.Set("Referer", "https://play.sooplive.co.kr/")
-	reqCdn.Header.Set("Accept-Language", "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2")
 	reqCdn.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	respCdn, err := globalHTTPClient.Do(reqCdn)
 	if err != nil {
-		return "", anchorName, err
+		return "", anchorName, avatar, err
 	}
 	defer respCdn.Body.Close()
 
 	bodyCdn, err := io.ReadAll(respCdn.Body)
 	if err != nil {
-		return "", anchorName, err
+		return "", anchorName, avatar, err
 	}
 
 	var cdnResult map[string]interface{}
 	if err := json.Unmarshal(bodyCdn, &cdnResult); err != nil {
-		return "", anchorName, fmt.Errorf("CDN响应 JSON 解析失败: %v, raw: %s", err, string(bodyCdn))
+		return "", anchorName, avatar, fmt.Errorf("CDN响应 JSON 解析失败: %v", err)
 	}
 
 	viewURL, ok := cdnResult["view_url"].(string)
 	if !ok || viewURL == "" {
-		return "", anchorName, fmt.Errorf("从 CDN 节点提取 view_url 失败")
+		return "", anchorName, avatar, fmt.Errorf("从 CDN 节点提取 view_url 失败")
 	}
 
 	finalStreamURL := fmt.Sprintf("%s?aid=%s", viewURL, aid)
 
-	return finalStreamURL, anchorName, nil
+	return finalStreamURL, anchorName, avatar, nil
 }
 
 // ==========================================
-// 核心修复：防损坏的优雅录制逻辑
+// 录制流逻辑
 // ==========================================
 
-func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorName, quality string, segmentTime int) {
-	updateStatus(platformName, roomID, anchorName, quality, "录制中")
+func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorName, avatar, quality string, segmentTime int) {
+	updateStatus(platformName, roomID, anchorName, avatar, quality, "录制中")
 	safeName := sanitizeFileName(anchorName)
 	if safeName == "" {
 		safeName = roomID
@@ -930,21 +1165,18 @@ func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorNa
 
 	if segmentTime > 0 {
 		outPath = filepath.Join(outDir, fmt.Sprintf("%s_%s_%%03d.mp4", safeName, timestamp))
-		args = []string{"-y", "-analyzeduration", "2000000", "-probesize", "2000000", "-i", streamURL, "-c", "copy", "-f", "segment", "-segment_time", fmt.Sprintf("%d", segmentTime*60), "-reset_timestamps", "1", outPath}
+		args = []string{"-y", "-analyzeduration", "2000000", "-probesize", "2000000", "-i", streamURL, "-c", "copy", "-f", "segment", "-segment_time", fmt.Sprintf("%d", segmentTime*60), "-reset_timestamps", "1", "-movflags", "frag_keyframe+empty_moov", outPath}
 	} else {
 		outPath = filepath.Join(outDir, fmt.Sprintf("%s_%s.mp4", safeName, timestamp))
-		args = []string{"-y", "-analyzeduration", "2000000", "-probesize", "2000000", "-i", streamURL, "-c", "copy", "-f", "mp4", outPath}
+		args = []string{"-y", "-analyzeduration", "2000000", "-probesize", "2000000", "-i", streamURL, "-c", "copy", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", outPath}
 	}
 
 	log.Printf("\n🟢 [开始录制] 平台: %s | 主播: %s | 画质: %s\n   📂 路径: %s", platformName, anchorName, formatQualityName(quality), outPath)
 
 	startTime := time.Now()
 
-	// 核心修复点 1：放弃使用 CommandContext 强制 Kill 进程
-	// 因为强制 Kill 会导致 MP4 无法写入末尾的 moov 元数据块，从而彻底损坏文件。
 	cmd := exec.Command(ffmpegPath, args...)
 
-	// 获取 ffmpeg 的标准输入通道 (stdin)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		log.Printf("获取ffmpeg stdin失败: %v", err)
@@ -956,11 +1188,10 @@ func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorNa
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("\n🔴 [启动录制失败] %s | %s: %v\n", platformName, anchorName, err)
-		updateStatus(platformName, roomID, anchorName, quality, "未开播等待中")
+		updateStatus(platformName, roomID, anchorName, avatar, quality, "未开播等待中")
 		return
 	}
 
-	// 监听进程自然结束
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Wait()
@@ -968,19 +1199,16 @@ func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorNa
 
 	select {
 	case <-ctx.Done():
-		// 核心修复点 2：收到暂停、删除任务或服务退出的信号时，优雅通知 ffmpeg 停止
-		// 向其发送 'q' 指令，ffmpeg 会自动结束录制、补全文件头部信息，绝不损坏文件！
 		if stdin != nil {
 			io.WriteString(stdin, "q\n")
 			stdin.Close()
 		}
 
-		// 给予 ffmpeg 最多 10 秒钟时间安全保存视频
 		select {
 		case <-done:
 			log.Printf("\n🔴 [手动停止] %s | %s | 录像已安全保存完毕\n", platformName, anchorName)
 		case <-time.After(10 * time.Second):
-			cmd.Process.Kill() // 只有 ffmpeg 卡死时才进行强杀
+			cmd.Process.Kill()
 			log.Printf("\n🔴 [手动停止超时强杀] %s | %s\n", platformName, anchorName)
 		}
 	case err := <-done:
@@ -992,30 +1220,16 @@ func RecordStream(ctx context.Context, streamURL, platformName, roomID, anchorNa
 		}
 	}
 
-	updateStatus(platformName, roomID, anchorName, quality, "未开播等待中")
+	updateStatus(platformName, roomID, anchorName, avatar, quality, "未开播等待中")
 }
 
 func MonitorLive(p Platform, roomID string) {
 	platformName := p.GetPlatformName()
 	key := platformName + "_" + roomID
 
-	isPaused := false
-	for _, pk := range globalConfig.PausedTasks {
-		if pk == key {
-			isPaused = true
-			break
-		}
-	}
-
-	if isPaused {
-		taskStates.Store(key, "paused")
-		log.Printf("👀 [启动监控] %s 房间: %s (初始状态: 已暂停)", platformName, roomID)
-		updateStatus(platformName, roomID, "", "-", "已暂停")
-	} else {
-		taskStates.Store(key, "running")
-		log.Printf("👀 [启动监控] %s 房间: %s", platformName, roomID)
-		updateStatus(platformName, roomID, "", "-", "监控中")
-	}
+	taskStates.Store(key, "running")
+	log.Printf("👀 [启动监控] %s 房间: %s", platformName, roomID)
+	updateStatus(platformName, roomID, "", "", "-", "监控中")
 
 	rand.Seed(time.Now().UnixNano())
 
@@ -1030,7 +1244,7 @@ func MonitorLive(p Platform, roomID string) {
 		}
 
 		if state == "paused" {
-			updateStatus(platformName, roomID, "", "-", "已暂停")
+			updateStatus(platformName, roomID, "", "", "-", "已暂停")
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -1041,10 +1255,15 @@ func MonitorLive(p Platform, roomID string) {
 		q := globalConfig.Quality
 		st := globalConfig.SegmentTime
 
-		url, name, err := p.GetStreamURL(roomID, q)
+		url, name, avatar, err := p.GetStreamURL(roomID, q)
+
+		if custom, ok := globalCustomNames.Load(key); ok && custom.(string) != "" {
+			name = custom.(string)
+		}
+
 		if err != nil {
 			log.Printf("⚠️ [检测出错] %s %s: %v", platformName, roomID, err)
-			updateStatus(platformName, roomID, name, q, "检测异常等待中")
+			updateStatus(platformName, roomID, name, avatar, q, "检测异常等待中")
 
 			sleepDur := globalConfig.CheckInterval
 			if sleepDur < 10 {
@@ -1057,13 +1276,22 @@ func MonitorLive(p Platform, roomID string) {
 			case <-t.C:
 			}
 		} else if url != "" {
-			updateStatus(platformName, roomID, name, q, "录制中")
-			RecordStream(ctx, url, platformName, roomID, name, q, st)
+			updateStatus(platformName, roomID, name, avatar, q, "录制中")
+
+			// ✨ 核心调用：在开始录制时，同时启动“伪实时画面刷新协程”
+			coverCtx, coverCancel := context.WithCancel(context.Background())
+			go updateLiveCoverLoop(coverCtx, platformName, roomID, url)
+
+			// 阻塞开始录制
+			RecordStream(ctx, url, platformName, roomID, name, avatar, q, st)
+
+			// 录制结束或断流了，立刻停止截帧
+			coverCancel()
 
 			state, _ = taskStates.Load(key)
 			if state != "deleted" && state != "paused" {
 				log.Printf("⏳ [断流等待] %s %s 进入15秒冷却...", platformName, name)
-				updateStatus(platformName, roomID, name, q, "断流缓冲中")
+				updateStatus(platformName, roomID, name, avatar, q, "断流缓冲中")
 
 				t := time.NewTimer(15 * time.Second)
 				select {
@@ -1073,8 +1301,13 @@ func MonitorLive(p Platform, roomID string) {
 				}
 			}
 		} else {
+			if name == "" {
+				if custom, ok := globalCustomNames.Load(key); ok && custom.(string) != "" {
+					name = custom.(string)
+				}
+			}
 			if name != "" {
-				updateStatus(platformName, roomID, name, q, "监控中")
+				updateStatus(platformName, roomID, name, avatar, q, "监控中")
 			}
 
 			sleepDur := globalConfig.CheckInterval
@@ -1083,7 +1316,7 @@ func MonitorLive(p Platform, roomID string) {
 			}
 			jitter := rand.Intn(5)
 
-			updateStatus(platformName, roomID, name, q, "未开播等待中")
+			updateStatus(platformName, roomID, name, avatar, q, "未开播等待中")
 
 			t := time.NewTimer(time.Duration(sleepDur+jitter) * time.Second)
 			select {
@@ -1107,27 +1340,84 @@ func startMonitorIfNotRunning(p Platform, roomID string) {
 	go MonitorLive(p, roomID)
 }
 
-func removeFromConfig(platform, roomID string) {
-	remove := func(slice []string, val string) []string {
-		var res []string
-		for _, s := range slice {
-			if s != val {
-				res = append(res, s)
+// ==========================================
+// WebSocket 服务与广播核心逻辑
+// ==========================================
+
+func doBroadcast() {
+	var list []TaskStatus
+	globalStatus.Range(func(key, value interface{}) bool {
+		task := *value.(*TaskStatus)
+
+		if task.Status == "录制中" && !task.startTime.IsZero() {
+			task.Duration = formatDuration(time.Since(task.startTime))
+		} else {
+			task.Duration = "-"
+		}
+
+		safeName := sanitizeFileName(task.AnchorName)
+		if safeName == "" {
+			safeName = task.RoomID
+		}
+		baseDir := globalConfig.SavePath
+		if baseDir == "" {
+			baseDir = "./downloads"
+		}
+		targetDir := filepath.Join(baseDir, safeName)
+		task.FileSize = getDirSizeStr(targetDir)
+
+		list = append(list, task)
+		return true
+	})
+
+	wsClients.Range(func(key, value interface{}) bool {
+		conn := key.(*websocket.Conn)
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if err := conn.WriteJSON(list); err != nil {
+			conn.Close()
+			wsClients.Delete(key)
+		}
+		return true
+	})
+}
+
+func broadcastStatusLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	for {
+		select {
+		case <-ticker.C:
+			doBroadcast()
+		case <-broadcastChan:
+			time.Sleep(50 * time.Millisecond) // 防抖
+			doBroadcast()
+			select {
+			case <-broadcastChan:
+			default:
 			}
 		}
-		return res
+	}
+}
+
+func handleWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("WebSocket升级失败:", err)
+		return
 	}
 
-	switch platform {
-	case "Douyin":
-		globalConfig.Douyin = remove(globalConfig.Douyin, roomID)
-	case "Kuaishou":
-		globalConfig.Kuaishou = remove(globalConfig.Kuaishou, roomID)
-	case "Soop":
-		globalConfig.Soop = remove(globalConfig.Soop, roomID)
-	}
+	wsClients.Store(conn, true)
+	triggerBroadcast()
 
-	saveConfig()
+	defer func() {
+		conn.Close()
+		wsClients.Delete(conn)
+	}()
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
 }
 
 // ==========================================
@@ -1135,7 +1425,10 @@ func removeFromConfig(platform, roomID string) {
 // ==========================================
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(indexHtml)
 }
 
@@ -1206,21 +1499,68 @@ func apiAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	var d struct{ Platform, URL string }
 	json.NewDecoder(r.Body).Decode(&d)
-	roomID := extractRoomID(d.URL)
-	var p Platform
-	switch d.Platform {
-	case "Douyin":
-		globalConfig.Douyin = append(globalConfig.Douyin, roomID)
-		p = &DouyinPlatform{}
-	case "Kuaishou":
-		globalConfig.Kuaishou = append(globalConfig.Kuaishou, roomID)
-		p = &KuaishouPlatform{}
-	case "Soop":
-		globalConfig.Soop = append(globalConfig.Soop, roomID)
-		p = &SoopPlatform{}
+
+	lines := strings.Split(d.URL, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		if line == "" || strings.HasPrefix(line, "//") {
+			continue
+		}
+
+		isP, platformName, roomID, customName, rawURL := parseLine(line)
+
+		if roomID == "" {
+			continue
+		}
+
+		if platformName == "" {
+			platformName = d.Platform
+		}
+
+		key := platformName + "_" + roomID
+
+		if customName != "" {
+			globalCustomNames.Store(key, customName)
+		}
+
+		if _, exists := activeTasks.Load(key); exists {
+			continue
+		}
+		if _, exists := globalStatus.Load(key); exists {
+			continue
+		}
+
+		var p Platform
+		switch platformName {
+		case "Douyin":
+			p = &DouyinPlatform{}
+		case "Kuaishou":
+			p = &KuaishouPlatform{}
+		case "Soop":
+			p = &SoopPlatform{}
+		default:
+			continue
+		}
+
+		syncAnchorToTxt("add", platformName, roomID, rawURL)
+
+		displayName := customName
+		if displayName == "" {
+			displayName = roomID
+		}
+
+		if isP {
+			taskStates.Store(key, "paused")
+			updateStatus(platformName, roomID, displayName, "", globalConfig.Quality, "已暂停")
+		} else {
+			updateStatus(platformName, roomID, displayName, "", globalConfig.Quality, "初始化中")
+			startMonitorIfNotRunning(p, roomID)
+		}
 	}
-	saveConfig()
-	startMonitorIfNotRunning(p, roomID)
+
+	triggerBroadcast()
 	w.Write([]byte(`{"code":0}`))
 }
 
@@ -1243,19 +1583,133 @@ func apiControl(w http.ResponseWriter, r *http.Request) {
 		if cancel, ok := activeCancels.Load(key); ok {
 			cancel.(context.CancelFunc)()
 		}
-		addPausedTask(key)
+		syncAnchorToTxt("pause", req.Platform, req.RoomID, "")
+
+		if existing, ok := globalStatus.Load(key); ok {
+			task := existing.(*TaskStatus)
+			task.IsPaused = true
+			task.Status = "已暂停"
+			globalStatus.Store(key, task)
+		}
+
 	case "resume":
 		taskStates.Store(key, "running")
-		removePausedTask(key)
+		syncAnchorToTxt("resume", req.Platform, req.RoomID, "")
+
+		if existing, ok := globalStatus.Load(key); ok {
+			task := existing.(*TaskStatus)
+			task.IsPaused = false
+			task.Status = "监控中"
+			globalStatus.Store(key, task)
+		}
+
+		var p Platform
+		switch req.Platform {
+		case "Douyin":
+			p = &DouyinPlatform{}
+		case "Kuaishou":
+			p = &KuaishouPlatform{}
+		case "Soop":
+			p = &SoopPlatform{}
+		}
+		if p != nil {
+			startMonitorIfNotRunning(p, req.RoomID)
+		}
+
 	case "delete":
 		taskStates.Store(key, "deleted")
 		if cancel, ok := activeCancels.Load(key); ok {
 			cancel.(context.CancelFunc)()
 		}
-		removeFromConfig(req.Platform, req.RoomID)
-		removePausedTask(key)
+		syncAnchorToTxt("delete", req.Platform, req.RoomID, "")
+		globalStatus.Delete(key)
+		activeTasks.Delete(key)
 	}
 
+	triggerBroadcast()
+	w.Write([]byte(`{"code":0}`))
+}
+
+// ==========================================
+// 🚀 一键批量控制接口 (全部开启 / 全部暂停)
+// ==========================================
+func apiControlAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		return
+	}
+	var req struct {
+		Action string `json:"action"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	anchorLinesMutex.Lock()
+	content, err := os.ReadFile("urls.txt")
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		var newLines []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if req.Action == "pause_all" {
+				if !strings.HasPrefix(trimmed, "#") {
+					newLines = append(newLines, "#"+trimmed)
+				} else {
+					newLines = append(newLines, trimmed)
+				}
+			} else if req.Action == "resume_all" {
+				if strings.HasPrefix(trimmed, "#") {
+					newLines = append(newLines, strings.TrimSpace(strings.TrimPrefix(trimmed, "#")))
+				} else {
+					newLines = append(newLines, trimmed)
+				}
+			}
+		}
+		os.WriteFile("urls.txt", []byte(strings.Join(newLines, "\n")+"\n"), 0644)
+	}
+	anchorLinesMutex.Unlock()
+
+	globalStatus.Range(func(key, value interface{}) bool {
+		task := value.(*TaskStatus)
+		parts := strings.SplitN(key.(string), "_", 2)
+		if len(parts) != 2 {
+			return true
+		}
+		platform, roomID := parts[0], parts[1]
+
+		if req.Action == "pause_all" {
+			taskStates.Store(key, "paused")
+			if cancel, ok := activeCancels.Load(key); ok {
+				cancel.(context.CancelFunc)()
+			}
+			task.IsPaused = true
+			task.Status = "已暂停"
+			globalStatus.Store(key, task)
+
+		} else if req.Action == "resume_all" {
+			taskStates.Store(key, "running")
+			task.IsPaused = false
+			task.Status = "监控中"
+			globalStatus.Store(key, task)
+
+			var p Platform
+			switch platform {
+			case "Douyin":
+				p = &DouyinPlatform{}
+			case "Kuaishou":
+				p = &KuaishouPlatform{}
+			case "Soop":
+				p = &SoopPlatform{}
+			}
+			if p != nil {
+				startMonitorIfNotRunning(p, roomID)
+			}
+		}
+		return true
+	})
+
+	triggerBroadcast()
 	w.Write([]byte(`{"code":0}`))
 }
 
@@ -1263,21 +1717,88 @@ func main() {
 	checkFFmpeg()
 
 	if _, err := os.Stat("config.json"); os.IsNotExist(err) {
-		globalConfig = &Config{Quality: "uhd", CheckInterval: 30, SavePath: "./downloads", PausedTasks: []string{}}
+		globalConfig = &Config{Quality: "uhd", CheckInterval: 30, SavePath: "./downloads"}
 		saveConfig()
 	} else {
 		d, _ := os.ReadFile("config.json")
 		globalConfig = &Config{}
 		json.Unmarshal(d, globalConfig)
 	}
+
 	if globalConfig.CheckInterval == 0 {
 		globalConfig.CheckInterval = 30
 	}
 	if globalConfig.SavePath == "" {
 		globalConfig.SavePath = "./downloads"
 	}
-	if globalConfig.PausedTasks == nil {
-		globalConfig.PausedTasks = []string{}
+
+	if _, err := os.Stat("urls.txt"); os.IsNotExist(err) {
+		d, err2 := os.ReadFile("config.json")
+		if err2 == nil {
+			var oldConf OldConfig
+			json.Unmarshal(d, &oldConf)
+			var lines []string
+
+			for _, id := range oldConf.Douyin {
+				isP := false
+				for _, p := range oldConf.PausedTasks {
+					if p == "Douyin_"+id {
+						isP = true
+					}
+				}
+				name := oldConf.CustomNames["Douyin_"+id]
+				prefix := ""
+				if isP {
+					prefix = "#"
+				}
+				suffix := ""
+				if name != "" {
+					suffix = ",主播: " + name
+				}
+				lines = append(lines, fmt.Sprintf("%shttps://live.douyin.com/%s%s", prefix, id, suffix))
+			}
+			for _, id := range oldConf.Kuaishou {
+				isP := false
+				for _, p := range oldConf.PausedTasks {
+					if p == "Kuaishou_"+id {
+						isP = true
+					}
+				}
+				name := oldConf.CustomNames["Kuaishou_"+id]
+				prefix := ""
+				if isP {
+					prefix = "#"
+				}
+				suffix := ""
+				if name != "" {
+					suffix = ",主播: " + name
+				}
+				lines = append(lines, fmt.Sprintf("%shttps://live.kuaishou.com/u/%s%s", prefix, id, suffix))
+			}
+			for _, id := range oldConf.Soop {
+				isP := false
+				for _, p := range oldConf.PausedTasks {
+					if p == "Soop_"+id {
+						isP = true
+					}
+				}
+				name := oldConf.CustomNames["Soop_"+id]
+				prefix := ""
+				if isP {
+					prefix = "#"
+				}
+				suffix := ""
+				if name != "" {
+					suffix = ",主播: " + name
+				}
+				lines = append(lines, fmt.Sprintf("%shttps://play.sooplive.co.kr/%s/0%s", prefix, id, suffix))
+			}
+
+			if len(lines) > 0 {
+				os.WriteFile("urls.txt", []byte(strings.Join(lines, "\n")+"\n"), 0644)
+				log.Println("✅ 成功将旧版 config.json 主播迁移至 urls.txt")
+			}
+		}
 	}
 
 	if _, err := os.Stat("cookies.json"); os.IsNotExist(err) {
@@ -1290,41 +1811,72 @@ func main() {
 		json.Unmarshal(d, globalCookies)
 	}
 
-	douyin := &DouyinPlatform{}
-	kuaishou := &KuaishouPlatform{}
-	soop := &SoopPlatform{}
+	content, err := os.ReadFile("urls.txt")
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		for _, line := range lines {
+			isPaused, platform, roomID, customName, _ := parseLine(line)
 
-	for _, id := range globalConfig.Douyin {
-		startMonitorIfNotRunning(douyin, extractRoomID(id))
-	}
-	for _, id := range globalConfig.Kuaishou {
-		startMonitorIfNotRunning(kuaishou, extractRoomID(id))
-	}
-	for _, id := range globalConfig.Soop {
-		startMonitorIfNotRunning(soop, extractRoomID(id))
+			if roomID == "" || platform == "" {
+				continue
+			}
+
+			key := platform + "_" + roomID
+
+			if customName != "" {
+				globalCustomNames.Store(key, customName)
+			}
+
+			var p Platform
+			switch platform {
+			case "Douyin":
+				p = &DouyinPlatform{}
+			case "Kuaishou":
+				p = &KuaishouPlatform{}
+			case "Soop":
+				p = &SoopPlatform{}
+			default:
+				continue
+			}
+
+			if isPaused {
+				taskStates.Store(key, "paused")
+				displayName := customName
+				if displayName == "" {
+					displayName = roomID
+				}
+				updateStatus(platform, roomID, displayName, "", globalConfig.Quality, "已暂停")
+			} else {
+				displayName := customName
+				if displayName == "" {
+					displayName = roomID
+				}
+				updateStatus(platform, roomID, displayName, "", globalConfig.Quality, "初始化中")
+				startMonitorIfNotRunning(p, roomID)
+			}
+		}
+	} else {
+		os.WriteFile("urls.txt", []byte(""), 0644)
 	}
 
-	// 核心修复点 3：全局防杀拦截，防止服务被重启、容器关闭时，直接强杀导致视频损坏
 	stopSignal := make(chan os.Signal, 1)
 	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-stopSignal
 		log.Println("\n⚠️ 收到系统退出/重启信号！正在通知所有录像安全收尾并保存，请稍候...")
-		// 广播取消所有的录制上下文，触发优雅保存（发送 'q'）
 		activeCancels.Range(func(key, value interface{}) bool {
 			if cancel, ok := value.(context.CancelFunc); ok {
 				cancel()
 			}
 			return true
 		})
-		// 等待 3 秒钟给 ffmpeg 充足的时间写完文件尾部
 		time.Sleep(3 * time.Second)
 		log.Println("✅ 所有视频均已安全保存！服务正式退出。")
 		os.Exit(0)
 	}()
 
-	log.Println("🚀 服务已启动，监听端口 9091")
-	log.Println("👉 请自行查看本机 IP 访问，或尝试: http://localhost:9091")
+	os.MkdirAll("./covers", os.ModePerm)
+	http.Handle("/covers/", http.StripPrefix("/covers/", http.FileServer(http.Dir("./covers"))))
 
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/api/config", apiConfig)
@@ -1332,6 +1884,14 @@ func main() {
 	http.HandleFunc("/api/status", apiStatus)
 	http.HandleFunc("/api/add", apiAdd)
 	http.HandleFunc("/api/control", apiControl)
+
+	http.HandleFunc("/api/control_all", apiControlAll)
+
+	http.HandleFunc("/ws/status", handleWS)
+	go broadcastStatusLoop()
+
+	log.Println("🚀 服务已启动，监听端口 9091")
+	log.Println("👉 请自行查看本机 IP 访问，或尝试: http://localhost:9091")
 
 	if err := http.ListenAndServe(":9091", nil); err != nil {
 		log.Fatalf("Web服务启动失败: %v", err)
