@@ -60,7 +60,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: live-recorder-${{ matrix.os }}-${{ matrix.arch }}
-          path: live-recorder-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+          path: live-recorder-*.tar.gz*
 
   release:
     name: Auto Release
