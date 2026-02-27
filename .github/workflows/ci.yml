@@ -59,8 +59,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: uploader-${{ matrix.os }}-${{ matrix.arch }}
-          path: uploader-*.tar.gz*
+          name: live-recorder-${{ matrix.os }}-${{ matrix.arch }}
+          path: live-recorder-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
 
   release:
     name: Auto Release
