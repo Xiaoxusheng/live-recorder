@@ -52,7 +52,7 @@ jobs:
           -o "$BIN_NAME"
 
           # 打包并生成 checksum
-          PKG_NAME="live_recorder-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
+          PKG_NAME="live-recorder-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
           tar -czf "$PKG_NAME" "$BIN_NAME"
           sha256sum "$PKG_NAME" > "$PKG_NAME.sha256"
 
